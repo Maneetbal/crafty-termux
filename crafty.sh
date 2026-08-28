@@ -5,6 +5,7 @@ set -Eeuo pipefail
 readonly CRAFTY_HOME="${HOME}/crafty"
 readonly CRAFTY_REPO="${CRAFTY_HOME}/crafty-4"
 readonly CRAFTY_VENV="${CRAFTY_REPO}/.venv"
+readonly CRAFTY_CREDS="${CRAFTY_REPO}/app/config/default-creds.txt"
 readonly MC_HOME="${HOME}/minecraft"
 readonly SERVICE_DIR="${PREFIX:-}/var/service"
 readonly CRAFTY_SERVICE="${SERVICE_DIR}/crafty"
@@ -184,7 +185,20 @@ verify() {
     [[ -n "${device_ip}" ]] || device_ip="DEVICE_IP"
     printf '\nCrafty directory: %s\n' "${CRAFTY_REPO}"
     printf 'Dashboard: https://%s:8443\n' "${device_ip}"
-    printf 'Credentials file: %s/app/config/default-creds.txt\n' "${CRAFTY_REPO}"
+    printf 'Credentials file: %s\n' "${CRAFTY_CREDS}"
+    if [[ -f "${CRAFTY_CREDS}" ]]; then
+        "${CRAFTY_VENV}/bin/python" - "${CRAFTY_CREDS}" <<'PY'
+import json
+import pathlib
+import sys
+
+credentials = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(f"Username: {credentials['username']}")
+print(f"Password: {credentials['password']}")
+PY
+    else
+        warn "Crafty credentials file was not generated yet."
+    fi
     printf 'Service status: sv status crafty\n'
 }
 
