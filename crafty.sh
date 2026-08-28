@@ -145,7 +145,14 @@ sv up crafty >/dev/null 2>&1 || true
 EOF
     chmod 700 "${BOOT_SCRIPT}"
 
-    sv up crafty || die "Unable to start Crafty through termux-services."
+    local attempt
+    for attempt in 1 2 3 4 5; do
+        if sv up crafty >/dev/null 2>&1; then
+            break
+        fi
+        sleep 2
+    done
+    sv status crafty >/dev/null 2>&1 || die "Unable to start Crafty through termux-services."
     ok "Crafty service is enabled and running"
     ok "Termux:Boot hook installed at ${BOOT_SCRIPT}"
 }
@@ -158,8 +165,14 @@ verify() {
     [[ -x "${CRAFTY_SERVICE}/run" ]] || die "Crafty service file is missing."
     [[ -x "${BOOT_SCRIPT}" ]] || die "Termux:Boot hook is missing."
 
-    sleep 5
-    sv status crafty
+    local attempt
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+        if curl -kfsS -o /dev/null https://127.0.0.1:8443/; then
+            break
+        fi
+        sleep 3
+    done
+    sv status crafty || die "Crafty service is not running."
     curl -kfsS -o /dev/null https://127.0.0.1:8443/ || die "Crafty HTTPS check failed."
     ok "Crafty HTTPS endpoint is responding"
     ok "Crafty installation completed"
@@ -187,3 +200,4 @@ main() {
 }
 
 main "$@"
+
