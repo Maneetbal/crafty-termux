@@ -45,7 +45,7 @@ Open:
 https://DEVICE_IP:8443
 ```
 
-The first-run username is `admin`. The generated password is printed in:
+The first-run username is `admin`. The generated username and password are printed at the end of `crafty.sh` and saved in:
 
 ```sh
 cat ~/crafty/crafty-4/app/config/default-creds.txt
@@ -141,3 +141,4 @@ ARM64 packages such as Pillow, orjson, and other Rust-backed dependencies may co
 ### Report a problem
 
 Open an issue at [github.com/Maneetbal/crafty-termux/issues](https://github.com/Maneetbal/crafty-termux/issues) and include the Termux version, Android version, device architecture, the failing command, and relevant non-sensitive log output. Never post your Crafty password or SSH credentials.
+
