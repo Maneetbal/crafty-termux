@@ -75,7 +75,7 @@ The installer installs OpenSSH if needed and uses the existing Termux SSH servic
 ssh -p 8022 USER@DEVICE_IP
 ```
 
-Existing SSH keys and configuration are preserved. If the service is not created automatically by `termux-services`, run:
+Existing SSH keys and configuration are preserved. The installer starts the Termux service supervisor immediately when needed, so a fresh install does not require manually restarting the shell. If the service still needs manual recovery, run:
 
 ```sh
 sv-enable sshd
