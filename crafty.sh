@@ -14,6 +14,8 @@ readonly BOOT_DIR="${HOME}/.termux/boot"
 readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
 
 TMP_DIR=""
+export SVDIR="${SERVICE_DIR}"
+export LOGDIR="${PREFIX:-}/var/log"
 
 say() { printf '\n==> %s\n' "$*"; }
 ok() { printf '    OK: %s\n' "$*"; }
@@ -48,8 +50,15 @@ configure_sshd() {
     [[ -x "${PREFIX}/bin/sshd" ]] || die "OpenSSH/SSHD was not installed."
 
     mkdir -p "${SERVICE_DIR}"
+    mkdir -p "${LOGDIR}"
+    if command -v service-daemon >/dev/null 2>&1; then
+        service-daemon start >/dev/null 2>&1 || true
+    fi
     if command -v sv-enable >/dev/null 2>&1; then
-        sv-enable sshd >/dev/null 2>&1 || true
+        for attempt in 1 2 3 4 5; do
+            sv-enable sshd >/dev/null 2>&1 && break
+            sleep 2
+        done
     fi
 
     if [[ ! -e "${SSH_SERVICE}" ]]; then
@@ -141,6 +150,8 @@ EOF
     cat > "${BOOT_SCRIPT}" <<EOF
 #!${PREFIX}/bin/sh
 # Starts Crafty and SSHD when Termux:Boot launches this user session.
+export SVDIR=${SERVICE_DIR}
+export LOGDIR=${LOGDIR}
 sv up sshd >/dev/null 2>&1 || true
 sv up crafty >/dev/null 2>&1 || true
 EOF
