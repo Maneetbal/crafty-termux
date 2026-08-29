@@ -11,7 +11,7 @@ err(){ echo "    ERROR: $*" >&2; exit 1; }
 
 printf '\n==> Installing packages\n'
 if ! { apt-get update -qq && apt-get install -y -qq openssh termux-services curl git python clang rust libffi openssl python-psutil python-cryptography python-pillow openjdk-21; } >/dev/null 2>&1; then
-    err "Package installation failed. Run: pkg update"
+    err "Package installation failed."
 fi
 echo '    OK: Packages installed'
 
@@ -26,8 +26,6 @@ printf '\n==> Installing Crafty\n'
 mkdir -p "$C"
 if [[ ! -d "$R/.git" ]]; then
     git clone --depth 1 https://gitlab.com/crafty-controller/crafty-4.git "$R" >/dev/null 2>&1 || err 'Failed to clone Crafty.'
-elif git -C "$R" diff --quiet && git -C "$R" diff --cached --quiet; then
-    git -C "$R" pull --ff-only --depth 1 >/dev/null 2>&1 || err 'Failed to update Crafty.'
 fi
 echo '    OK: Crafty source ready'
 
@@ -42,15 +40,18 @@ PY
 
 printf '\n==> Installing Python dependencies\n'
 [[ -x "$P" ]] || python -m venv --system-site-packages "$R/.venv"
-t=$(mktemp -d)
-trap 'rm -rf "$t"' EXIT
+t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
 grep -Ev '^(psutil|cryptography|pillow)==' "$R/requirements.txt" > "$t/requirements.txt"
-printf 'cryptography==48.0.1\n' > "$t/constraints.txt"
-if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --no-cache-dir -c "$t/constraints.txt" -r "$t/requirements.txt" >/dev/null 2>&1; then
-    rm -rf "$t"; trap - EXIT
-    err "Python dependency installation failed."
+if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --no-cache-dir --prefer-binary -r "$t/requirements.txt" >"$C/pip-install.log" 2>&1; then
+    echo '    ERROR: Python dependency installation failed.' >&2
+    tail -n 30 "$C/pip-install.log" >&2
+    exit 1
 fi
-"$P" -m pip install --disable-pip-version-check --no-cache-dir tzdata >/dev/null 2>&1 || err "Failed to install tzdata."
+"$P" -m pip install --disable-pip-version-check --no-cache-dir tzdata >>"$C/pip-install.log" 2>&1 || {
+    echo '    ERROR: Failed to install tzdata.' >&2
+    tail -n 20 "$C/pip-install.log" >&2
+    exit 1
+}
 rm -rf "$t"; trap - EXIT
 echo '    OK: Python dependencies installed'
 
@@ -67,12 +68,8 @@ cat > "$BOOT" <<EOF
 #!$PREFIX/bin/sh
 export SVDIR=$S LOGDIR=$PREFIX/var/log
 service-daemon start >/dev/null 2>&1 || true
-for i in 1 2 3 4 5; do
-    sv up sshd >/dev/null 2>&1 || true
-    sv up crafty >/dev/null 2>&1 || true
-    sv status crafty >/dev/null 2>&1 && break
-    sleep 2
-done
+sv up sshd >/dev/null 2>&1 || true
+sv up crafty >/dev/null 2>&1 || true
 EOF
 chmod 700 "$BOOT"
 
@@ -112,4 +109,4 @@ printf '\n========================================\n  CRAFTY INSTALLATION COMPLE
 printf 'Dashboard : https://%s:8443\nUsername  : %s\nPassword  : %s\n' "$ip" "$user" "$pass"
 printf '========================================\n\nSSHD status:\n'; sv status sshd
 printf '\nCrafty status:\n'; sv status crafty
-printf '\nCredentials: %s\nLog: %s\n' "$CREDS" "$LOG"
+printf '\nCredentials: %s\n' "$CREDS"
