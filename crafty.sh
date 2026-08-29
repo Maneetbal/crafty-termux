@@ -6,42 +6,34 @@ readonly CRAFTY_HOME="${HOME}/crafty"
 readonly CRAFTY_REPO="${CRAFTY_HOME}/crafty-4"
 readonly CRAFTY_VENV="${CRAFTY_REPO}/.venv"
 readonly CRAFTY_CREDS="${CRAFTY_REPO}/app/config/default-creds.txt"
-readonly MC_HOME="${HOME}/minecraft"
 readonly SERVICE_DIR="${PREFIX:-}/var/service"
 readonly CRAFTY_SERVICE="${SERVICE_DIR}/crafty"
 readonly SSH_SERVICE="${SERVICE_DIR}/sshd"
 readonly BOOT_DIR="${HOME}/.termux/boot"
 readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
 readonly BASHRC="${HOME}/.bashrc"
+readonly LOGDIR="${PREFIX:-}/var/log"
 
 TMP_DIR=""
 export SVDIR="${SERVICE_DIR}"
-export LOGDIR="${PREFIX:-}/var/log"
+export LOGDIR
 
 say() { printf '\n==> %s\n' "$*"; }
 ok() { printf '    OK: %s\n' "$*"; }
 warn() { printf '    WARNING: %s\n' "$*" >&2; }
 die() { printf '    ERROR: %s\n' "$*" >&2; exit 1; }
-
-cleanup() {
-    if [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]]; then
-        rm -rf -- "${TMP_DIR}"
-    fi
-}
+cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "${TMP_DIR}"; }
 trap cleanup EXIT
 
 require_termux() {
-    [[ -n "${PREFIX:-}" && -x "${PREFIX}/bin/pkg" ]] || \
-        die "This script must run inside Termux."
-    [[ "$(uname -o 2>/dev/null || true)" == "Android" ]] || \
-        warn "The host does not identify as Android; continuing because PREFIX is valid."
+    [[ -n "${PREFIX:-}" && -x "${PREFIX}/bin/pkg" ]] || die "This script must run inside Termux."
+    [[ "$(uname -o 2>/dev/null || true)" == "Android" ]] || warn "Host is not identified as Android; continuing because PREFIX is valid."
 }
 
 install_packages() {
     say "Installing required Termux packages"
     pkg update -y
-    pkg install -y \
-        openssh termux-services curl git python clang make openssl libffi rust cmake \
+    pkg install -y openssh termux-services curl git python clang make openssl libffi rust cmake \
         python-psutil python-cryptography python-pillow openjdk-21
     ok "Termux packages are installed"
 }
@@ -49,31 +41,16 @@ install_packages() {
 configure_sshd() {
     say "Configuring SSHD"
     [[ -x "${PREFIX}/bin/sshd" ]] || die "OpenSSH/SSHD was not installed."
+    mkdir -p "${SERVICE_DIR}" "${LOGDIR}"
+    command -v service-daemon >/dev/null 2>&1 && service-daemon start >/dev/null 2>&1 || true
+    command -v sv-enable >/dev/null 2>&1 && sv-enable sshd >/dev/null 2>&1 || true
 
-    mkdir -p "${SERVICE_DIR}"
-    mkdir -p "${LOGDIR}"
-    if command -v service-daemon >/dev/null 2>&1; then
-        service-daemon start >/dev/null 2>&1 || true
-    fi
-    if command -v sv-enable >/dev/null 2>&1; then
-        for attempt in 1 2 3 4 5; do
-            sv-enable sshd >/dev/null 2>&1 && break
-            sleep 2
-        done
-    fi
-
-    if [[ ! -e "${SSH_SERVICE}" ]]; then
-        warn "The termux-services SSHD service was not created automatically."
-        warn "Run: sv-enable sshd"
-    else
+    if [[ -e "${SSH_SERVICE}" ]]; then
         sv up sshd || die "Unable to start SSHD through termux-services."
         ok "SSHD service is enabled and running"
-    fi
-
-    if [[ -f "${PREFIX}/etc/ssh/sshd_config" ]]; then
-        ok "Existing SSHD configuration preserved"
     else
-        warn "No sshd_config was found; Termux defaults will be used."
+        warn "The termux-services SSHD service was not created automatically."
+        warn "Run: sv-enable sshd"
     fi
 }
 
@@ -82,19 +59,16 @@ clone_or_update_crafty() {
     mkdir -p "${CRAFTY_HOME}"
     if [[ ! -d "${CRAFTY_REPO}/.git" ]]; then
         git clone --depth 1 https://gitlab.com/crafty-controller/crafty-4.git "${CRAFTY_REPO}"
+    elif git -C "${CRAFTY_REPO}" diff --quiet && git -C "${CRAFTY_REPO}" diff --cached --quiet; then
+        git -C "${CRAFTY_REPO}" pull --ff-only --depth 1
     else
-        git -C "${CRAFTY_REPO}" fetch --depth 1 origin
-        if git -C "${CRAFTY_REPO}" diff --quiet && git -C "${CRAFTY_REPO}" diff --cached --quiet; then
-            git -C "${CRAFTY_REPO}" pull --ff-only --depth 1
-        else
-            warn "Local Crafty changes detected; leaving them untouched."
-        fi
+        warn "Local Crafty changes detected; leaving them untouched."
     fi
     ok "Crafty source is present at ${CRAFTY_REPO}"
 }
 
 patch_for_termux() {
-    say "Applying the minimal Android compatibility patch"
+    say "Applying the Android compatibility patch"
     python - "${CRAFTY_REPO}/app/classes/helpers/helpers.py" <<'PY'
 import pathlib
 import sys
@@ -110,9 +84,7 @@ new = """        try:
 """
 if old in text:
     path.write_text(text.replace(old, new, 1), encoding="utf-8")
-elif "partitions = psutil.disk_partitions(all=False)" in text:
-    pass
-else:
+elif "partitions = psutil.disk_partitions(all=False)" not in text:
     raise SystemExit("Crafty helper layout changed; refusing to patch automatically")
 PY
     ok "Android /proc permission compatibility is configured"
@@ -120,43 +92,27 @@ PY
 
 install_python_dependencies() {
     say "Installing Crafty Python dependencies"
-    if [[ ! -x "${CRAFTY_VENV}/bin/python" ]]; then
-        python -m venv --system-site-packages "${CRAFTY_VENV}"
-    fi
-
+    [[ -x "${CRAFTY_VENV}/bin/python" ]] || python -m venv --system-site-packages "${CRAFTY_VENV}"
     TMP_DIR="$(mktemp -d "${PREFIX}/tmp/crafty-termux.XXXXXX")"
-    grep -Ev '^(psutil|cryptography|pillow)==' "${CRAFTY_REPO}/requirements.txt" \
-        > "${TMP_DIR}/requirements.termux.txt"
+    grep -Ev '^(psutil|cryptography|pillow)==' "${CRAFTY_REPO}/requirements.txt" > "${TMP_DIR}/requirements.txt"
     printf 'cryptography==48.0.1\n' > "${TMP_DIR}/constraints.txt"
-
     export ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir \
-        -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.termux.txt"
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.txt"
     "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
     ok "Crafty Python dependencies are installed"
 }
 
 configure_shell_environment() {
     say "Configuring Termux service environment"
-    mkdir -p "$(dirname "${BASHRC}")"
     touch "${BASHRC}"
-    local svdir_line="export SVDIR=\"${SERVICE_DIR}\""
-    local logdir_line="export LOGDIR=\"${LOGDIR}\""
-
-    if ! grep -Fqx "${svdir_line}" "${BASHRC}"; then
-        printf '\n# termux-services service directory\n%s\n' "${svdir_line}" >> "${BASHRC}"
-    fi
-    if ! grep -Fqx "${logdir_line}" "${BASHRC}"; then
-        printf '%s\n' "${logdir_line}" >> "${BASHRC}"
-    fi
-    export SVDIR="${SERVICE_DIR}"
-    export LOGDIR="${LOGDIR}"
+    grep -Fqx "export SVDIR=\"${SERVICE_DIR}\"" "${BASHRC}" || printf '\nexport SVDIR="%s"\n' "${SERVICE_DIR}" >> "${BASHRC}"
+    grep -Fqx "export LOGDIR=\"${LOGDIR}\"" "${BASHRC}" || printf 'export LOGDIR="%s"\n' "${LOGDIR}" >> "${BASHRC}"
     ok "SVDIR is configured persistently for sv commands"
 }
 
 configure_crafty_service() {
     say "Configuring Crafty autostart"
-    mkdir -p "${CRAFTY_SERVICE}" "${CRAFTY_HOME}/logs" "${MC_HOME}"
+    mkdir -p "${CRAFTY_SERVICE}" "${CRAFTY_HOME}/logs" "${HOME}/minecraft"
     cat > "${CRAFTY_SERVICE}/run" <<EOF
 #!${PREFIX}/bin/sh
 cd ${CRAFTY_REPO}
@@ -168,7 +124,6 @@ EOF
     mkdir -p "${BOOT_DIR}"
     cat > "${BOOT_SCRIPT}" <<EOF
 #!${PREFIX}/bin/sh
-# Starts Crafty and SSHD when Termux:Boot launches this user session.
 export SVDIR=${SERVICE_DIR}
 export LOGDIR=${LOGDIR}
 sv up sshd >/dev/null 2>&1 || true
@@ -176,11 +131,8 @@ sv up crafty >/dev/null 2>&1 || true
 EOF
     chmod 700 "${BOOT_SCRIPT}"
 
-    local attempt
-    for attempt in 1 2 3 4 5; do
-        if sv up crafty >/dev/null 2>&1; then
-            break
-        fi
+    for _ in {1..5}; do
+        sv up crafty >/dev/null 2>&1 && break
         sleep 2
     done
     sv status crafty >/dev/null 2>&1 || die "Unable to start Crafty through termux-services."
@@ -191,45 +143,47 @@ EOF
 verify() {
     say "Verifying installation"
     [[ -x "${PREFIX}/bin/sshd" ]] || die "SSHD executable is missing."
-    [[ -x "${CRAFTY_VENV}/bin/python" ]] || die "Crafty virtual environment is missing."
-    [[ -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty main.py is missing."
-    [[ -x "${CRAFTY_SERVICE}/run" ]] || die "Crafty service file is missing."
-    [[ -x "${BOOT_SCRIPT}" ]] || die "Termux:Boot hook is missing."
+    [[ -x "${CRAFTY_VENV}/bin/python" && -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty installation is incomplete."
+    [[ -x "${CRAFTY_SERVICE}/run" && -x "${BOOT_SCRIPT}" ]] || die "Crafty autostart files are missing."
 
-    local attempt
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-        if curl -kfsS -o /dev/null https://127.0.0.1:8443/; then
-            break
-        fi
+    for _ in {1..10}; do
+        curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
         sleep 3
     done
-    sv status crafty || die "Crafty service is not running."
     curl -kfsS -o /dev/null https://127.0.0.1:8443/ || die "Crafty HTTPS check failed."
     ok "Crafty HTTPS endpoint is responding"
-    ok "Crafty installation completed"
-    local device_ip
+}
+
+show_success() {
+    local device_ip username password
     device_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    if [[ -z "${device_ip}" || "${device_ip}" == "127.0.0.1" ]]; then
-        device_ip="$(ifconfig 2>/dev/null | awk '/inet / && $2 != "127.0.0.1" {print $2; exit}' || true)"
-    fi
-    [[ -n "${device_ip}" ]] || device_ip="DEVICE_IP"
-    printf '\nCrafty directory: %s\n' "${CRAFTY_REPO}"
-    printf 'Dashboard: https://%s:8443\n' "${device_ip}"
-    printf 'Credentials file: %s\n' "${CRAFTY_CREDS}"
+    [[ -n "${device_ip}" && "${device_ip}" != "127.0.0.1" ]] || device_ip="DEVICE_IP"
+
+    username="admin"
+    password="Unavailable"
     if [[ -f "${CRAFTY_CREDS}" ]]; then
-        "${CRAFTY_VENV}/bin/python" - "${CRAFTY_CREDS}" <<'PY'
+        read -r username password < <("${CRAFTY_VENV}/bin/python" - "${CRAFTY_CREDS}" <<'PY'
 import json
 import pathlib
 import sys
-
-credentials = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(f"Username: {credentials['username']}")
-print(f"Password: {credentials['password']}")
+c = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(c.get("username", "admin"), c.get("password", "Unavailable"))
 PY
-    else
-        warn "Crafty credentials file was not generated yet."
+)
     fi
-    printf 'Service status: sv status crafty\n'
+
+    printf '\n========================================\n'
+    printf '       CRAFTY INSTALLATION COMPLETE\n'
+    printf '========================================\n'
+    printf 'Dashboard : https://%s:8443\n' "${device_ip}"
+    printf 'Username  : %s\n' "${username}"
+    printf 'Password  : %s\n' "${password}"
+    printf '========================================\n\n'
+    printf 'SSHD status:\n'
+    sv status sshd
+    printf '\nCrafty status:\n'
+    sv status crafty
+    printf '\nCredentials file: %s\n' "${CRAFTY_CREDS}"
 }
 
 main() {
@@ -242,6 +196,7 @@ main() {
     configure_shell_environment
     configure_crafty_service
     verify
+    show_success
 }
 
 main "$@"
