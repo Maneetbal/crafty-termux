@@ -11,8 +11,8 @@ err(){ echo "    ERROR: $*" >&2; exit 1; }
 [[ -x "$PREFIX/bin/pkg" ]] || err "Run this script in Termux."
 
 printf '\n==> Installing packages\n'
-apt-get update -qq || err "Package index update failed. Run 'pkg update' and try again."
-apt-get install -y -qq openssh termux-services curl git python clang rust libffi openssl python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
+pkg update -y || err "Package index update failed. Run 'pkg update' and try again."
+pkg install -y openssh termux-services curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
 echo '    OK: Packages installed'
 
 python - <<'PY' || exit 1
@@ -55,12 +55,17 @@ grep -Ev '^(psutil|cryptography|pillow)==' "$R/requirements.txt" > "$t/requireme
 export PIP_NO_INPUT=1 CARGO_TERM_COLOR=never
 export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
 (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
+export ARGON2_CFFI_USE_SYSTEM=1
+export CMAKE_PREFIX_PATH="$PREFIX"
+export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
+export PATH="$PREFIX/bin:$PATH"
 
-echo '    Native/Rust-backed packages may take several minutes on Android.'
+echo '    Using Termux system CMake/Argon2/LLVM to avoid pip building CMake from source.'
+echo '    Native/Rust-backed packages may still take several minutes on Android.'
 echo "    Live output is shown and saved to $C/pip-install.log"
-if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --prefer-binary -r "$t/requirements.txt" 2>&1 | tee "$C/pip-install.log"; then
+if ! "$P" -m pip install --disable-pip-version-check --prefer-binary -r "$t/requirements.txt" 2>&1 | tee "$C/pip-install.log"; then
     echo '    ERROR: Python dependency installation failed.' >&2
-    tail -n 40 "$C/pip-install.log" >&2 || true
+    tail -n 60 "$C/pip-install.log" >&2 || true
     exit 1
 fi
 if ! "$P" -m pip install --disable-pip-version-check tzdata 2>&1 | tee -a "$C/pip-install.log"; then
