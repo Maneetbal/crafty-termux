@@ -12,6 +12,7 @@ readonly CRAFTY_SERVICE="${SERVICE_DIR}/crafty"
 readonly SSH_SERVICE="${SERVICE_DIR}/sshd"
 readonly BOOT_DIR="${HOME}/.termux/boot"
 readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
+readonly BASHRC="${HOME}/.bashrc"
 
 TMP_DIR=""
 export SVDIR="${SERVICE_DIR}"
@@ -135,6 +136,24 @@ install_python_dependencies() {
     ok "Crafty Python dependencies are installed"
 }
 
+configure_shell_environment() {
+    say "Configuring Termux service environment"
+    mkdir -p "$(dirname "${BASHRC}")"
+    touch "${BASHRC}"
+    local svdir_line="export SVDIR=\"${SERVICE_DIR}\""
+    local logdir_line="export LOGDIR=\"${LOGDIR}\""
+
+    if ! grep -Fqx "${svdir_line}" "${BASHRC}"; then
+        printf '\n# termux-services service directory\n%s\n' "${svdir_line}" >> "${BASHRC}"
+    fi
+    if ! grep -Fqx "${logdir_line}" "${BASHRC}"; then
+        printf '%s\n' "${logdir_line}" >> "${BASHRC}"
+    fi
+    export SVDIR="${SERVICE_DIR}"
+    export LOGDIR="${LOGDIR}"
+    ok "SVDIR is configured persistently for sv commands"
+}
+
 configure_crafty_service() {
     say "Configuring Crafty autostart"
     mkdir -p "${CRAFTY_SERVICE}" "${CRAFTY_HOME}/logs" "${MC_HOME}"
@@ -220,9 +239,9 @@ main() {
     clone_or_update_crafty
     patch_for_termux
     install_python_dependencies
+    configure_shell_environment
     configure_crafty_service
     verify
 }
 
 main "$@"
-
