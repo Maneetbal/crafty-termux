@@ -42,12 +42,21 @@ printf '\n==> Installing Python dependencies\n'
 [[ -x "$P" ]] || python -m venv --system-site-packages "$R/.venv"
 t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
 grep -Ev '^(psutil|cryptography|pillow)==' "$R/requirements.txt" > "$t/requirements.txt"
-if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --no-cache-dir --prefer-binary -r "$t/requirements.txt" >"$C/pip-install.log" 2>&1; then
+
+# Keep pip output visible. Native/Rust-backed packages such as nh3 can take a while
+# to build on Android, and hiding stderr/stdout makes a live build look frozen.
+export PIP_NO_INPUT=1
+export CARGO_TERM_COLOR=never
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 2)}"
+
+echo '    Installing native/Rust-backed dependencies may take several minutes on Android.'
+echo "    Live output is shown below and saved to $C/pip-install.log"
+if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --prefer-binary -r "$t/requirements.txt" 2>&1 | tee "$C/pip-install.log"; then
     echo '    ERROR: Python dependency installation failed.' >&2
     tail -n 30 "$C/pip-install.log" >&2
     exit 1
 fi
-"$P" -m pip install --disable-pip-version-check --no-cache-dir tzdata >>"$C/pip-install.log" 2>&1 || {
+"$P" -m pip install --disable-pip-version-check tzdata 2>&1 | tee -a "$C/pip-install.log" || {
     echo '    ERROR: Failed to install tzdata.' >&2
     tail -n 20 "$C/pip-install.log" >&2
     exit 1
