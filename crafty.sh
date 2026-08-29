@@ -4,18 +4,19 @@ set -Eeuo pipefail
 C="$HOME/crafty"; R="$C/crafty-4"; P="$R/.venv/bin/python"
 S="$PREFIX/var/service"; CREDS="$R/app/config/default-creds.txt"
 LOG="$C/logs/crafty.log"; BOOT="$HOME/.termux/boot/start-crafty"
-export SVDIR="$S" LOGDIR="$PREFIX/var/log"
+export SVDIR="$S" LOGDIR="$PREFIX/var/log" PIP_DISABLE_PIP_VERSION_CHECK=1
 
 err(){ echo "    ERROR: $*" >&2; exit 1; }
 [[ -x "$PREFIX/bin/pkg" ]] || err "Run this script in Termux."
 
 printf '\n==> Installing packages\n'
-pkg update -y >/dev/null
-pkg install -y openssh termux-services curl git python clang make openssl libffi rust cmake python-psutil python-cryptography python-pillow openjdk-21 >/dev/null
+if ! { apt-get update -qq && apt-get install -y -qq openssh termux-services curl git python clang rust libffi openssl python-psutil python-cryptography python-pillow openjdk-21; } >/dev/null 2>&1; then
+    err "Package installation failed. Run: pkg update"
+fi
 echo '    OK: Packages installed'
 
 mkdir -p "$S" "$PREFIX/var/log"
-command -v service-daemon >/dev/null 2>&1 && service-daemon start >/dev/null 2>&1 || true
+service-daemon start >/dev/null 2>&1 || true
 sv-enable sshd >/dev/null 2>&1 || true
 [[ -d "$S/sshd" ]] || err 'SSHD service was not created.'
 sv up sshd >/dev/null 2>&1 || err 'Failed to start SSHD.'
@@ -23,7 +24,11 @@ echo '    OK: SSHD is running'
 
 printf '\n==> Installing Crafty\n'
 mkdir -p "$C"
-[[ -d "$R/.git" ]] || git clone --depth 1 https://gitlab.com/crafty-controller/crafty-4.git "$R"
+if [[ ! -d "$R/.git" ]]; then
+    git clone --depth 1 https://gitlab.com/crafty-controller/crafty-4.git "$R" >/dev/null 2>&1 || err 'Failed to clone Crafty.'
+elif git -C "$R" diff --quiet && git -C "$R" diff --cached --quiet; then
+    git -C "$R" pull --ff-only --depth 1 >/dev/null 2>&1 || err 'Failed to update Crafty.'
+fi
 echo '    OK: Crafty source ready'
 
 python - "$R/app/classes/helpers/helpers.py" <<'PY'
@@ -32,15 +37,20 @@ p=pathlib.Path(sys.argv[1]); s=p.read_text()
 a='        for item in psutil.disk_partitions(all=False):\n'
 b='''        try:\n            partitions = psutil.disk_partitions(all=False)\n        except PermissionError:\n            partitions = []\n        for item in partitions:\n'''
 if a in s: p.write_text(s.replace(a,b,1))
+elif 'partitions = psutil.disk_partitions(all=False)' not in s: raise SystemExit('Crafty compatibility patch target changed')
 PY
 
 printf '\n==> Installing Python dependencies\n'
 [[ -x "$P" ]] || python -m venv --system-site-packages "$R/.venv"
-t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
+t=$(mktemp -d)
+trap 'rm -rf "$t"' EXIT
 grep -Ev '^(psutil|cryptography|pillow)==' "$R/requirements.txt" > "$t/requirements.txt"
 printf 'cryptography==48.0.1\n' > "$t/constraints.txt"
-ANDROID_API_LEVEL=34 "$P" -m pip install --no-cache-dir -c "$t/constraints.txt" -r "$t/requirements.txt" >/dev/null
-"$P" -m pip install --no-cache-dir tzdata >/dev/null
+if ! ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}" "$P" -m pip install --disable-pip-version-check --no-cache-dir -c "$t/constraints.txt" -r "$t/requirements.txt" >/dev/null 2>&1; then
+    rm -rf "$t"; trap - EXIT
+    err "Python dependency installation failed."
+fi
+"$P" -m pip install --disable-pip-version-check --no-cache-dir tzdata >/dev/null 2>&1 || err "Failed to install tzdata."
 rm -rf "$t"; trap - EXIT
 echo '    OK: Python dependencies installed'
 
@@ -56,8 +66,13 @@ chmod 700 "$S/crafty/run"
 cat > "$BOOT" <<EOF
 #!$PREFIX/bin/sh
 export SVDIR=$S LOGDIR=$PREFIX/var/log
-sv up sshd >/dev/null 2>&1 || true
-sv up crafty >/dev/null 2>&1 || true
+service-daemon start >/dev/null 2>&1 || true
+for i in 1 2 3 4 5; do
+    sv up sshd >/dev/null 2>&1 || true
+    sv up crafty >/dev/null 2>&1 || true
+    sv status crafty >/dev/null 2>&1 && break
+    sleep 2
+done
 EOF
 chmod 700 "$BOOT"
 
@@ -75,13 +90,15 @@ grep -Fqx "export LOGDIR=\"$PREFIX/var/log\"" "$HOME/.bashrc" 2>/dev/null || ech
 printf '\n==> Verifying\n'
 ready=0
 for i in {1..30}; do
-    if curl -kfsS --connect-timeout 1 --max-time 2 -o /dev/null https://127.0.0.1:8443/ 2>/dev/null; then ready=1; break; fi
+    if curl -ksf --connect-timeout 1 --max-time 2 https://127.0.0.1:8443/ >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
 done
 (( ready )) || { echo '    ERROR: Crafty HTTPS endpoint is not responding'; tail -n 20 "$LOG" 2>/dev/null || true; exit 1; }
 echo '    OK: Crafty HTTPS endpoint is responding'
 
-ip=$(hostname -I 2>/dev/null | awk '{print $1}'); [[ -n "$ip" ]] || ip=DEVICE_IP
+ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+[[ -n "$ip" ]] || ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
+[[ -n "$ip" ]] || ip="127.0.0.1"
 user=admin; pass=Unavailable
 if [[ -f "$CREDS" ]]; then
     read -r user pass < <("$P" - "$CREDS" <<'PY'
@@ -95,4 +112,4 @@ printf '\n========================================\n  CRAFTY INSTALLATION COMPLE
 printf 'Dashboard : https://%s:8443\nUsername  : %s\nPassword  : %s\n' "$ip" "$user" "$pass"
 printf '========================================\n\nSSHD status:\n'; sv status sshd
 printf '\nCrafty status:\n'; sv status crafty
-printf '\nCredentials: %s\n' "$CREDS"
+printf '\nCredentials: %s\nLog: %s\n' "$CREDS" "$LOG"
