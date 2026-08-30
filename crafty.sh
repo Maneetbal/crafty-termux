@@ -45,6 +45,7 @@ configure_java() {
     export JAVA_HOME="${JAVA_HOME_TERMUX}"
     export PATH="${JAVA_HOME}/bin:${PATH}"
     hash -r 2>/dev/null || true
+    local java_version
     java_version="$(java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
     [[ "$java_version" == 25.* ]] || die "Java 25 is required for current Velocity builds; found ${java_version:-unknown}."
     ok "Java 25 is the active runtime (${java_version})"
@@ -121,12 +122,12 @@ install_python_dependencies() {
     "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -r "${TMP_DIR}/requirements.txt"
     "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
 
-    # Do not allow pip to shadow Termux's Android-compatible cryptography build.
-    # A venv created with --system-site-packages can see python-cryptography from
-    # Termux, but pip may otherwise install a newer incompatible local wheel.
+    # pip can satisfy webauthn's cryptography dependency by installing a local
+    # wheel that is incompatible with Android's Python runtime. Remove any pip
+    # copy so the venv falls back to Termux's python-cryptography package.
     "${CRAFTY_VENV}/bin/python" -m pip uninstall -y cryptography >/dev/null 2>&1 || true
-    "${PREFIX}/bin/python" - <<'PY'
-import cryptography, sys
+    "${CRAFTY_VENV}/bin/python" - <<'PY'
+import cryptography
 from cryptography.hazmat.bindings import _rust
 print(f"    Using Termux cryptography {cryptography.__version__}: {cryptography.__file__}")
 PY
@@ -183,6 +184,13 @@ verify() {
     [[ -x "${PREFIX}/bin/sshd" ]] || die "SSHD executable is missing."
     [[ -x "${CRAFTY_VENV}/bin/python" && -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty installation is incomplete."
     [[ -x "${CRAFTY_SERVICE}/run" && -x "${BOOT_SCRIPT}" ]] || die "Crafty autostart files are missing."
+    "${CRAFTY_VENV}/bin/python" - <<'PY'
+import cryptography
+from cryptography.hazmat.bindings import _rust
+if not cryptography.__file__.startswith('/data/data/'):
+    raise SystemExit(f'Unexpected cryptography path: {cryptography.__file__}')
+print(f"    OK: venv cryptography {cryptography.__version__}")
+PY
 
     for _ in {1..10}; do
         curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
@@ -218,7 +226,7 @@ PY
     printf 'Username  : %s\n' "${username}"
     printf 'Password  : %s\n' "${password}"
     printf '========================================\n\n'
-    printf 'Java      : ' 
+    printf 'Java      : '
     "${JAVA_HOME_TERMUX}/bin/java" -version 2>&1 | head -n 1
     printf '\nSSHD status:\n'
     sv status sshd 2>/dev/null || true
