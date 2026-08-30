@@ -15,15 +15,21 @@ pkg update -y || err "Package index update failed. Run 'pkg update' and try agai
 pkg install -y openssh termux-services curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
 echo '    OK: Packages installed'
 
-python - <<'PY' || exit 1
+python - <<'PY' || err 'Python 3.9+ is required.'
 import sys
 if sys.version_info < (3, 9):
     raise SystemExit(f"Python 3.9+ required; found {sys.version.split()[0]}")
 PY
 
-mkdir -p "$S" "$PREFIX/var/log" "$C/logs"
+mkdir -p "$S" "$PREFIX/var/log" "$PREFIX/var/run" "$C/logs"
+export SVDIR="$S" LOGDIR="$PREFIX/var/log"
 service-daemon start >/dev/null 2>&1 || true
-sv-enable sshd >/dev/null 2>&1 || { sv up sshd >/dev/null 2>&1 || err 'Failed to enable/start SSHD.'; }
+sleep 1
+sv-enable sshd >/dev/null 2>&1 || true
+if ! sv status sshd 2>/dev/null | grep -q '^run:'; then
+    sv up sshd >/dev/null 2>&1 || true
+fi
+sv status sshd 2>/dev/null | grep -q '^run:' || err 'Failed to start SSHD. Run: sv status sshd'
 echo '    OK: SSHD is running'
 
 printf '\n==> Installing Crafty %s\n' "$CRAFTY_TAG"
@@ -77,7 +83,7 @@ rm -rf "$t"; trap - EXIT
 echo '    OK: Python dependencies installed'
 
 printf '\n==> Configuring services\n'
-mkdir -p "$S/crafty" "$S/crafty/log" "$C/logs" "$HOME/minecraft" "$(dirname "$BOOT")"
+mkdir -p "$S/crafty/log" "$C/logs" "$HOME/minecraft" "$(dirname "$BOOT")"
 cat > "$S/crafty/run" <<EOF
 #!$PREFIX/bin/sh
 cd "$R" || exit 1
@@ -85,16 +91,24 @@ export PYTHONUNBUFFERED=1
 exec "$P" main.py -d -i >> "$LOG" 2>&1
 EOF
 chmod 700 "$S/crafty/run"
-ln -sf "$PREFIX/share/termux-services/svlogger" "$S/crafty/log/run" 2>/dev/null || true
-sv-enable crafty >/dev/null 2>&1 || { sv up crafty >/dev/null 2>&1 || err 'Failed to enable/start Crafty.'; }
+rm -f "$S/crafty/down"
+ln -sf "$PREFIX/share/termux-services/svlogger" "$S/crafty/log/run"
+chmod 700 "$S/crafty/log/run" 2>/dev/null || true
+
+# Start the runit supervisor again after creating the service. This also works
+# when the installer is run in an already-open Termux session.
+service-daemon restart >/dev/null 2>&1 || service-daemon start >/dev/null 2>&1 || true
+sleep 2
+sv up crafty >/dev/null 2>&1 || true
 
 cat > "$BOOT" <<EOF
 #!$PREFIX/bin/sh
 export SVDIR="$S" LOGDIR="$PREFIX/var/log"
 mkdir -p "$PREFIX/var/run"
 service-daemon start >/dev/null 2>&1 || true
+rm -f "$S/crafty/down"
+sv up crafty >/dev/null 2>&1 || true
 sv-enable sshd >/dev/null 2>&1 || true
-sv-enable crafty >/dev/null 2>&1 || true
 EOF
 chmod 700 "$BOOT"
 
@@ -104,7 +118,18 @@ for i in {1..60}; do
     if sv status crafty 2>/dev/null | grep -q '^run:'; then started=1; break; fi
     sleep 1
 done
-(( started )) || { echo '    ERROR: Crafty failed to start' >&2; tail -n 40 "$LOG" 2>/dev/null || true; echo "    Service log: $PREFIX/var/log/sv/crafty/current" >&2; exit 1; }
+if (( ! started )); then
+    echo '    ERROR: Crafty failed to start.' >&2
+    echo '    Service status:' >&2
+    sv status crafty 2>&1 || true
+    echo '    Run script syntax:' >&2
+    "$PREFIX/bin/sh" -n "$S/crafty/run" 2>&1 || true
+    echo '    Crafty log:' >&2
+    tail -n 80 "$LOG" 2>/dev/null || true
+    echo '    Runit log:' >&2
+    tail -n 80 "$PREFIX/var/log/sv/crafty/current" 2>/dev/null || true
+    exit 1
+fi
 echo '    OK: Crafty service is running'
 
 grep -Fqx "export SVDIR=\"$S\"" "$HOME/.bashrc" 2>/dev/null || echo "export SVDIR=\"$S\"" >> "$HOME/.bashrc"
@@ -116,7 +141,11 @@ for i in {1..60}; do
     if curl -ksf --connect-timeout 1 --max-time 2 https://127.0.0.1:8443/ >/dev/null 2>&1; then ready=1; break; fi
     sleep 1
 done
-(( ready )) || { echo '    ERROR: Crafty HTTPS endpoint is not responding' >&2; tail -n 40 "$LOG" 2>/dev/null || true; exit 1; }
+if (( ! ready )); then
+    echo '    ERROR: Crafty HTTPS endpoint is not responding.' >&2
+    tail -n 80 "$LOG" 2>/dev/null || true
+    exit 1
+fi
 echo '    OK: Crafty HTTPS endpoint is responding'
 
 ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
