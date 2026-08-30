@@ -12,10 +12,10 @@ err(){ echo "    ERROR: $*" >&2; exit 1; }
 
 printf '\n==> Installing packages\n'
 pkg update -y || err "Package index update failed. Run 'pkg update' and try again."
-pkg install -y openssh termux-services curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
-# Reinstall OpenSSH so its current Termux service definition is present even when
-# OpenSSH was installed before termux-services.
-pkg reinstall -y openssh >/dev/null 2>&1 || true
+pkg install -y openssh termux-services runit curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
+# OpenSSH installs its runit service definition. Reinstalling after termux-services
+# guarantees the logger/service files exist on a completely fresh Termux install.
+pkg reinstall -y openssh || err "OpenSSH service files could not be installed."
 echo '    OK: Packages installed'
 
 python - <<'PY' || err 'Python 3.9+ is required.'
@@ -24,34 +24,33 @@ if sys.version_info < (3, 9):
     raise SystemExit(f"Python 3.9+ required; found {sys.version.split()[0]}")
 PY
 
-# termux-services normally initializes these after a shell restart. Do it here
-# explicitly so the installer works in the same Termux session.
+# termux-services normally starts runsvdir after a shell restart. Initialize it
+# explicitly here so this installer works on the very first shell after install.
 mkdir -p "$S" "$PREFIX/var/log" "$PREFIX/var/run" "$C/logs"
 export SVDIR="$S" LOGDIR="$PREFIX/var/log"
 if [[ -f "$PREFIX/etc/profile.d/start-services.sh" ]]; then
     # shellcheck disable=SC1091
     . "$PREFIX/etc/profile.d/start-services.sh" || true
 fi
-# The profile script may launch service-daemon asynchronously.
-if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
-    service-daemon start >/dev/null 2>&1 || true
-fi
+# start-services.sh launches service-daemon in the background. Give it a moment.
 sleep 2
-
-# OpenSSH's package owns its service directory. Restore it if it is missing.
-if [[ ! -d "$S/sshd" ]]; then
-    pkg reinstall -y openssh >/dev/null 2>&1 || true
+if ! pgrep -x runsvdir >/dev/null 2>&1; then
+    service-daemon start >/dev/null 2>&1 || true
+    sleep 2
 fi
-if [[ -d "$S/sshd" ]]; then
-    rm -f "$S/sshd/down"
-    SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
-    if ! SVDIR="$S" sv status sshd 2>/dev/null | grep -q '^run:'; then
-        echo '    WARNING: SSHD service exists but is not running; continuing with Crafty.'
-    else
-        echo '    OK: SSHD is running'
-    fi
+
+# The OpenSSH package normally creates this directory itself.
+[[ -d "$S/sshd" ]] || err "OpenSSH installed but $S/sshd is missing."
+chmod 700 "$S/sshd/run"
+rm -f "$S/sshd/down"
+
+printf '\n==> Starting SSHD service\n'
+SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
+if SVDIR="$S" sv status sshd 2>/dev/null | grep -q '^run:'; then
+    echo '    OK: SSHD is running'
 else
-    echo '    WARNING: SSHD service definition is unavailable; continuing with Crafty.'
+    echo '    WARNING: SSHD service did not start; Crafty installation will continue.'
+    SVDIR="$S" sv status sshd 2>&1 || true
 fi
 
 printf '\n==> Installing Crafty %s\n' "$CRAFTY_TAG"
@@ -104,7 +103,7 @@ fi
 rm -rf "$t"; trap - EXIT
 echo '    OK: Python dependencies installed'
 
-printf '\n==> Configuring services\n'
+printf '\n==> Configuring Crafty service\n'
 mkdir -p "$S/crafty/log" "$C/logs" "$HOME/minecraft" "$(dirname "$BOOT")"
 cat > "$S/crafty/run" <<EOF
 #!$PREFIX/bin/sh
@@ -117,8 +116,8 @@ rm -f "$S/crafty/down"
 ln -sf "$PREFIX/share/termux-services/svlogger" "$S/crafty/log/run"
 chmod 700 "$S/crafty/log/run" 2>/dev/null || true
 
-# Make sure the supervisor is actually watching the service directory.
-if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
+# runsvdir watches $S. It does not require a shell restart when started here.
+if ! pgrep -x runsvdir >/dev/null 2>&1; then
     service-daemon start >/dev/null 2>&1 || true
     sleep 2
 fi
@@ -126,15 +125,16 @@ SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
 
 cat > "$BOOT" <<EOF
 #!$PREFIX/bin/sh
-export SVDIR="$S" LOGDIR="$PREFIX/var/log"
+export SVDIR="$S"
+export LOGDIR="$PREFIX/var/log"
 mkdir -p "$PREFIX/var/run" "$S"
-if [[ -f "$PREFIX/etc/profile.d/start-services.sh" ]]; then
+if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
     . "$PREFIX/etc/profile.d/start-services.sh" || true
 fi
-if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
+if ! pgrep -x runsvdir >/dev/null 2>&1; then
     service-daemon start >/dev/null 2>&1 || true
 fi
-rm -f "$S/crafty/down"
+rm -f "$S/crafty/down" "$S/sshd/down"
 SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
 SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
 EOF
