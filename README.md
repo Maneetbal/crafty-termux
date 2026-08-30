@@ -2,7 +2,7 @@
 
 `crafty-termux` installs and runs the official Crafty Controller on Android through Termux. It configures Crafty and Termux's SSH server as user-level services and adds a Termux:Boot hook for startup after Android boot.
 
-This project adapts Crafty for Termux. Crafty itself is not a fork: the installer checks out a tested Crafty release and applies one small Android compatibility patch for restricted `/proc` access. Termux-native packages are used where Android cannot use normal Linux wheels.
+This project adapts Crafty for Termux. Crafty itself is not a fork: the installer checks out the tested Crafty release and applies one small Android compatibility patch for restricted `/proc` access. Termux-native packages are used where Android cannot use normal Linux wheels.
 
 ## Requirements
 
@@ -11,7 +11,7 @@ This project adapts Crafty for Termux. Crafty itself is not a fork: the installe
 - Termux:Boot from the same source, opened once after installation if you want boot startup
 - Network access and approximately 1.5 GB free space for build dependencies
 - Battery-optimization exemption for Termux if Android stops long-running services
-- Python 3.9+ supplied by current Termux packages
+- Current Termux packages with Python 3.9+
 
 The installer does not require root. Termux processes run as the app's unprivileged Android user.
 
@@ -29,24 +29,27 @@ The installer is designed to be rerunnable. It pins the Crafty source to the tes
 
 ## What the installer does
 
-1. Installs or updates Termux packages, including OpenSSH, Python, build tools, Rust, Java 21, and Termux services.
-2. Checks that the Termux Python version meets Crafty's minimum requirement.
+1. Installs or updates Termux packages, including OpenSSH, Python, build tools, Rust, Java 25, and Termux services.
+2. Verifies that Java 25 is installed and makes it the active Java runtime. This prevents current Velocity builds (class file version 69 / Java 25) from accidentally being launched with Java 21.
 3. Starts and enables SSHD through the Termux service supervisor without rewriting an existing SSH configuration.
 4. Clones or updates the Crafty source to the tested release.
 5. Creates a Python virtual environment using Termux-native system packages.
 6. Applies the minimal Android compatibility patch required by Crafty's disk-mount detection.
-7. Installs Python dependencies with live output; Rust/native builds are allowed to take several minutes.
-8. Creates, enables, and starts the `crafty` runit service.
-9. Creates `~/.termux/boot/start-crafty` for optional boot startup.
-10. Verifies both the service and Crafty's HTTPS endpoint.
+7. Installs Python dependencies with live output. Native/Rust packages may compile locally.
+8. Prevents pip from shadowing Termux's Android-compatible `cryptography` package with an incompatible binary wheel.
+9. Creates, enables, and starts the `crafty` runit service with Java 25 explicitly exported to the service environment.
+10. Creates `~/.termux/boot/start-crafty` with the same Java 25 environment for boot startup.
+11. Verifies the Crafty service, the venv's cryptography import, and Crafty's HTTPS endpoint before reporting success.
 
 ## Accessing Crafty
 
 Open:
 
 ```text
-https://DEVICE_IP:8443
+https://localhost:8443
 ```
+
+When accessing Crafty from another device on the LAN, use the Android device's LAN IP instead of `localhost`.
 
 The generated username and password are printed at the end of the installer and stored in:
 
@@ -70,19 +73,34 @@ sv down crafty
 sv restart crafty
 ```
 
-`termux-services` uses runit and automatically supervises enabled services. Its service logs are under `$PREFIX/var/log/sv/<service>/current`. citeturn0search0
+`termux-services` uses runit and supervises enabled services. Its service logs are under `$PREFIX/var/log/sv/<service>/current`.
 
-Crafty's installer log is:
+Crafty's Python dependency log is:
 
 ```sh
 ~/crafty/pip-install.log
 ```
 
-The Crafty service/application log is:
+The Crafty application log is:
 
 ```sh
-~/crafty/logs/crafty.log
+~/crafty/logs/crafty-service.log
 ```
+
+## Java / Velocity
+
+The installer uses **OpenJDK 25** because current Velocity builds may require Java 25. The installer checks `java -version`, sets `JAVA_HOME` to the Termux Java 25 installation, and puts its `bin` directory first in `PATH`.
+
+Verify manually:
+
+```sh
+java -version
+echo "$JAVA_HOME"
+```
+
+Both should point to Java 25.
+
+Crafty's runit service also exports Java 25 explicitly, so it does not depend on whatever Java happens to be selected in an interactive shell.
 
 ## SSHD
 
@@ -92,11 +110,11 @@ The installer installs OpenSSH if needed and uses the existing Termux SSH servic
 ssh -p 8022 USER@DEVICE_IP
 ```
 
-Existing SSH keys and configuration are preserved. `sv-enable sshd` makes the service persistent under the Termux service supervisor. citeturn0search1
+Existing SSH keys and configuration are preserved. `sv-enable sshd` makes the service persistent under the Termux service supervisor.
 
 ## Minecraft server
 
-Java 21 is installed so Crafty can manage modern Minecraft Java servers. The installer creates `~/minecraft`, but it does not accept Mojang's EULA or download a server jar automatically. Add a server through Crafty's web panel and accept the EULA yourself.
+Java 25 is installed for modern Minecraft/Velocity management. The installer creates `~/minecraft`, but it does not accept Mojang's EULA or download a server jar automatically. Add a server through Crafty's web panel and accept the EULA yourself.
 
 ## Updating Crafty
 
@@ -136,25 +154,42 @@ To remove the Crafty installation and its data as well, first back up anything y
 
 ```sh
 sv status crafty
-tail -n 100 ~/crafty/logs/crafty.log
+tail -n 100 ~/crafty/logs/crafty-service.log
 tail -n 100 "$PREFIX/var/log/sv/crafty/current"
 ```
 
-Make sure Termux has not been battery-restricted. Android can terminate background processes, and Termux's own documentation notes that daemonized processes can be more vulnerable to Android process killing. citeturn0search11
+Make sure Termux has not been battery-restricted. Android can terminate background processes.
 
-### SSH connection refused
+### Velocity says `UnsupportedClassVersionError`
+
+Check:
 
 ```sh
-sv status sshd
-sv restart sshd
-sshd -T | grep -E '^(port|listenaddress) '
+java -version
+$PREFIX/lib/jvm/java-25-openjdk/bin/java -version
 ```
 
-Confirm the device IP address and use port `8022` unless you intentionally changed the SSH configuration.
+Then check the Crafty service environment:
+
+```sh
+cat "$PREFIX/var/service/crafty/run"
+```
+
+The service should contain `JAVA_HOME` pointing to `java-25-openjdk`.
+
+### `cryptography` fails with `PyBaseObject_Type` or another `dlopen` error
+
+The installer is designed to avoid this by using Termux's `python-cryptography` package rather than a pip-installed Android-incompatible wheel. Verify the active venv copy with:
+
+```sh
+~/crafty/crafty-4/.venv/bin/python -c 'import cryptography; print(cryptography.__version__, cryptography.__file__)'
+```
+
+If you manually changed the environment, rerun `./crafty.sh` to restore the tested dependency setup.
 
 ### Installation is slow
 
-ARM64 packages such as `nh3`, Pillow, or other native/Rust-backed dependencies may compile locally. The installer now streams pip output and saves it to `~/crafty/pip-install.log`, so a long build should no longer look completely frozen.
+ARM64 packages such as `nh3`, `orjson`, Pillow, `rpds-py`, or other native/Rust-backed dependencies may compile locally. The installer streams pip output so a long build should not look completely frozen.
 
 ### Dependency installation fails
 
