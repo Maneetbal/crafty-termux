@@ -14,6 +14,7 @@ readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
 readonly BASHRC="${HOME}/.bashrc"
 readonly LOGDIR="${PREFIX:-}/var/log"
 readonly CRAFTY_TAG="v4.10.8"
+readonly JAVA_HOME_TERMUX="${PREFIX:-}/lib/jvm/java-25-openjdk"
 
 TMP_DIR=""
 export SVDIR="${SERVICE_DIR}"
@@ -33,9 +34,20 @@ require_termux() {
 install_packages() {
     say "Installing required Termux packages"
     pkg update -y
-    pkg install -y openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
+    pkg install -y openssh termux-services curl git python clang llvm make openssl rust cmake pkg-config argon2 \
         python-psutil python-cryptography python-pillow openjdk-25
     ok "Termux packages are installed"
+}
+
+configure_java() {
+    say "Configuring Java 25"
+    [[ -x "${JAVA_HOME_TERMUX}/bin/java" ]] || die "OpenJDK 25 is not installed correctly."
+    export JAVA_HOME="${JAVA_HOME_TERMUX}"
+    export PATH="${JAVA_HOME}/bin:${PATH}"
+    hash -r 2>/dev/null || true
+    java_version="$(java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
+    [[ "$java_version" == 25.* ]] || die "Java 25 is required for current Velocity builds; found ${java_version:-unknown}."
+    ok "Java 25 is the active runtime (${java_version})"
 }
 
 configure_sshd() {
@@ -95,7 +107,6 @@ install_python_dependencies() {
 
     TMP_DIR="$(mktemp -d "${PREFIX}/tmp/crafty-termux.XXXXXX")"
     grep -Ev '^(psutil|cryptography|pillow)==' "${CRAFTY_REPO}/requirements.txt" > "${TMP_DIR}/requirements.txt"
-    printf 'cryptography==48.0.1\n' > "${TMP_DIR}/constraints.txt"
 
     export ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}"
     export ARGON2_CFFI_USE_SYSTEM=1
@@ -107,8 +118,19 @@ install_python_dependencies() {
 
     echo "    Installing native dependencies from Termux where available"
     echo "    Live pip output is shown below"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.txt"
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -r "${TMP_DIR}/requirements.txt"
     "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
+
+    # Do not allow pip to shadow Termux's Android-compatible cryptography build.
+    # A venv created with --system-site-packages can see python-cryptography from
+    # Termux, but pip may otherwise install a newer incompatible local wheel.
+    "${CRAFTY_VENV}/bin/python" -m pip uninstall -y cryptography >/dev/null 2>&1 || true
+    "${PREFIX}/bin/python" - <<'PY'
+import cryptography, sys
+from cryptography.hazmat.bindings import _rust
+print(f"    Using Termux cryptography {cryptography.__version__}: {cryptography.__file__}")
+PY
+
     ok "Crafty Python dependencies are installed"
 }
 
@@ -117,7 +139,9 @@ configure_shell_environment() {
     touch "${BASHRC}"
     grep -Fqx "export SVDIR=\"${SERVICE_DIR}\"" "${BASHRC}" || printf '\nexport SVDIR="%s"\n' "${SERVICE_DIR}" >> "${BASHRC}"
     grep -Fqx "export LOGDIR=\"${LOGDIR}\"" "${BASHRC}" || printf 'export LOGDIR="%s"\n' "${LOGDIR}" >> "${BASHRC}"
-    ok "SVDIR is configured persistently for sv commands"
+    grep -Fqx "export JAVA_HOME=\"${JAVA_HOME_TERMUX}\"" "${BASHRC}" || printf 'export JAVA_HOME="%s"\n' "${JAVA_HOME_TERMUX}" >> "${BASHRC}"
+    grep -Fqx 'export PATH="$JAVA_HOME/bin:$PATH"' "${BASHRC}" || printf 'export PATH="$JAVA_HOME/bin:$PATH"\n' >> "${BASHRC}"
+    ok "SVDIR, LOGDIR, and Java 25 are configured persistently"
 }
 
 configure_crafty_service() {
@@ -127,6 +151,8 @@ configure_crafty_service() {
 #!${PREFIX}/bin/sh
 cd ${CRAFTY_REPO}
 export TZ=UTC
+export JAVA_HOME=${JAVA_HOME_TERMUX}
+export PATH="\$JAVA_HOME/bin:\$PATH"
 exec ${CRAFTY_VENV}/bin/python main.py --daemon >> ${CRAFTY_HOME}/logs/crafty-service.log 2>&1
 EOF
     chmod 700 "${CRAFTY_SERVICE}/run"
@@ -136,6 +162,8 @@ EOF
 #!${PREFIX}/bin/sh
 export SVDIR=${SERVICE_DIR}
 export LOGDIR=${LOGDIR}
+export JAVA_HOME=${JAVA_HOME_TERMUX}
+export PATH="\$JAVA_HOME/bin:\$PATH"
 sv up sshd >/dev/null 2>&1 || true
 sv up crafty >/dev/null 2>&1 || true
 EOF
@@ -160,7 +188,11 @@ verify() {
         curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
         sleep 3
     done
-    curl -kfsS -o /dev/null https://127.0.0.1:8443/ || die "Crafty HTTPS check failed."
+    curl -kfsS -o /dev/null https://127.0.0.1:8443/ || {
+        echo '    ERROR: Crafty HTTPS check failed.' >&2
+        tail -n 80 "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null || true
+        exit 1
+    }
     ok "Crafty HTTPS endpoint is responding"
 }
 
@@ -186,7 +218,9 @@ PY
     printf 'Username  : %s\n' "${username}"
     printf 'Password  : %s\n' "${password}"
     printf '========================================\n\n'
-    printf 'SSHD status:\n'
+    printf 'Java      : ' 
+    "${JAVA_HOME_TERMUX}/bin/java" -version 2>&1 | head -n 1
+    printf '\nSSHD status:\n'
     sv status sshd 2>/dev/null || true
     printf '\nCrafty status:\n'
     sv status crafty
@@ -196,6 +230,7 @@ PY
 main() {
     require_termux
     install_packages
+    configure_java
     configure_sshd
     clone_or_update_crafty
     patch_for_termux
