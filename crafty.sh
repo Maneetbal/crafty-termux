@@ -165,10 +165,7 @@ verify() {
 }
 
 show_success() {
-    local device_ip username password
-    device_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
-    [[ -n "${device_ip}" && "${device_ip}" != "127.0.0.1" ]] || device_ip="DEVICE_IP"
-
+    local username password
     username="admin"
     password="Unavailable"
     if [[ -f "${CRAFTY_CREDS}" ]]; then
@@ -185,7 +182,7 @@ PY
     printf '\n========================================\n'
     printf '       CRAFTY INSTALLATION COMPLETE\n'
     printf '========================================\n'
-    printf 'Dashboard : https://%s:8443\n' "${device_ip}"
+    printf 'Dashboard : https://localhost:8443\n'
     printf 'Username  : %s\n' "${username}"
     printf 'Password  : %s\n' "${password}"
     printf '========================================\n\n'
