@@ -1,197 +1,223 @@
 #!/data/data/com.termux/files/usr/bin/bash
+
 set -Eeuo pipefail
 
-C="$HOME/crafty"; R="$C/crafty-4"; P="$R/.venv/bin/python"
-S="$PREFIX/var/service"; CREDS="$R/app/config/default-creds.txt"
-LOG="$C/logs/crafty.log"; BOOT="$HOME/.termux/boot/start-crafty"
-CRAFTY_TAG="v4.10.8"
-export SVDIR="$S" LOGDIR="$PREFIX/var/log" PIP_DISABLE_PIP_VERSION_CHECK=1
+readonly CRAFTY_HOME="${HOME}/crafty"
+readonly CRAFTY_REPO="${CRAFTY_HOME}/crafty-4"
+readonly CRAFTY_VENV="${CRAFTY_REPO}/.venv"
+readonly CRAFTY_CREDS="${CRAFTY_REPO}/app/config/default-creds.txt"
+readonly SERVICE_DIR="${PREFIX:-}/var/service"
+readonly CRAFTY_SERVICE="${SERVICE_DIR}/crafty"
+readonly SSH_SERVICE="${SERVICE_DIR}/sshd"
+readonly BOOT_DIR="${HOME}/.termux/boot"
+readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
+readonly BASHRC="${HOME}/.bashrc"
+readonly LOGDIR="${PREFIX:-}/var/log"
+readonly CRAFTY_TAG="v4.10.8"
 
-err(){ echo "    ERROR: $*" >&2; exit 1; }
-[[ -x "$PREFIX/bin/pkg" ]] || err "Run this script in Termux."
+TMP_DIR=""
+export SVDIR="${SERVICE_DIR}"
+export LOGDIR
 
-printf '\n==> Installing packages\n'
-pkg update -y || err "Package index update failed. Run 'pkg update' and try again."
-pkg install -y openssh termux-services runit curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
-# OpenSSH installs its runit service definition. Reinstalling after termux-services
-# guarantees the logger/service files exist on a completely fresh Termux install.
-pkg reinstall -y openssh || err "OpenSSH service files could not be installed."
-echo '    OK: Packages installed'
+say() { printf '\n==> %s\n' "$*"; }
+ok() { printf '    OK: %s\n' "$*"; }
+warn() { printf '    WARNING: %s\n' "$*" >&2; }
+die() { printf '    ERROR: %s\n' "$*" >&2; exit 1; }
+cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "${TMP_DIR}"; }
+trap cleanup EXIT
 
-python - <<'PY' || err 'Python 3.9+ is required.'
+require_termux() {
+    [[ -n "${PREFIX:-}" && -x "${PREFIX}/bin/pkg" ]] || die "This script must run inside Termux."
+    [[ "$(uname -o 2>/dev/null || true)" == "Android" ]] || warn "Host is not identified as Android; continuing because PREFIX is valid."
+}
+
+install_packages() {
+    say "Installing required Termux packages"
+    pkg update -y || die "Package index update failed."
+    pkg install -y openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
+        python-psutil python-cryptography python-pillow openjdk-21 || die "Required Termux packages could not be installed."
+    ok "Termux packages are installed"
+}
+
+configure_sshd() {
+    say "Configuring SSHD"
+    [[ -x "${PREFIX}/bin/sshd" ]] || die "OpenSSH/SSHD was not installed."
+    mkdir -p "${SERVICE_DIR}" "${LOGDIR}"
+    command -v service-daemon >/dev/null 2>&1 && service-daemon start >/dev/null 2>&1 || true
+    command -v sv-enable >/dev/null 2>&1 && sv-enable sshd >/dev/null 2>&1 || true
+
+    if [[ -e "${SSH_SERVICE}" ]]; then
+        sv up sshd || die "Unable to start SSHD through termux-services."
+        ok "SSHD service is enabled and running"
+    else
+        warn "The termux-services SSHD service was not created automatically."
+        warn "Run: sv-enable sshd"
+    fi
+}
+
+clone_or_update_crafty() {
+    say "Installing Crafty Controller ${CRAFTY_TAG}"
+    mkdir -p "${CRAFTY_HOME}"
+    if [[ ! -d "${CRAFTY_REPO}/.git" ]]; then
+        git clone --depth 1 --branch "${CRAFTY_TAG}" https://gitlab.com/crafty-controller/crafty-4.git "${CRAFTY_REPO}" || \
+            die "Failed to clone Crafty ${CRAFTY_TAG}."
+    elif git -C "${CRAFTY_REPO}" diff --quiet && git -C "${CRAFTY_REPO}" diff --cached --quiet; then
+        git fetch --depth 1 origin tag "${CRAFTY_TAG}" || die "Failed to fetch Crafty ${CRAFTY_TAG}."
+        git checkout --force "${CRAFTY_TAG}" || die "Failed to checkout Crafty ${CRAFTY_TAG}."
+    else
+        warn "Local Crafty changes detected; leaving them untouched."
+    fi
+    ok "Crafty source is present at ${CRAFTY_REPO}"
+}
+
+patch_for_termux() {
+    say "Applying the Android compatibility patch"
+    python - "${CRAFTY_REPO}/app/classes/helpers/helpers.py" <<'PY'
+import pathlib
 import sys
-if sys.version_info < (3, 9):
-    raise SystemExit(f"Python 3.9+ required; found {sys.version.split()[0]}")
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = "        for item in psutil.disk_partitions(all=False):\n"
+new = """        try:
+            partitions = psutil.disk_partitions(all=False)
+        except PermissionError:
+            partitions = []
+        for item in partitions:
+"""
+if old in text:
+    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+elif "partitions = psutil.disk_partitions(all=False)" not in text:
+    raise SystemExit("Crafty helper layout changed; refusing to patch automatically")
 PY
+    ok "Android /proc permission compatibility is configured"
+}
 
-# termux-services normally starts runsvdir after a shell restart. Initialize it
-# explicitly here so this installer works on the very first shell after install.
-mkdir -p "$S" "$PREFIX/var/log" "$PREFIX/var/run" "$C/logs"
-export SVDIR="$S" LOGDIR="$PREFIX/var/log"
-if [[ -f "$PREFIX/etc/profile.d/start-services.sh" ]]; then
-    # shellcheck disable=SC1091
-    . "$PREFIX/etc/profile.d/start-services.sh" || true
-fi
-# start-services.sh launches service-daemon in the background. Give it a moment.
-sleep 2
-if ! pgrep -x runsvdir >/dev/null 2>&1; then
-    service-daemon start >/dev/null 2>&1 || true
-    sleep 2
-fi
+install_python_dependencies() {
+    say "Installing Crafty Python dependencies"
+    [[ -x "${CRAFTY_VENV}/bin/python" ]] || python -m venv --system-site-packages "${CRAFTY_VENV}"
 
-# The OpenSSH package normally creates this directory itself.
-[[ -d "$S/sshd" ]] || err "OpenSSH installed but $S/sshd is missing."
-chmod 700 "$S/sshd/run"
-rm -f "$S/sshd/down"
+    TMP_DIR="$(mktemp -d "${PREFIX}/tmp/crafty-termux.XXXXXX")"
+    grep -Ev '^(psutil|cryptography|pillow)==' "${CRAFTY_REPO}/requirements.txt" > "${TMP_DIR}/requirements.txt"
+    printf 'cryptography==48.0.1\n' > "${TMP_DIR}/constraints.txt"
 
-printf '\n==> Starting SSHD service\n'
-SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
-if SVDIR="$S" sv status sshd 2>/dev/null | grep -q '^run:'; then
-    echo '    OK: SSHD is running'
-else
-    echo '    WARNING: SSHD service did not start; Crafty installation will continue.'
-    SVDIR="$S" sv status sshd 2>&1 || true
-fi
+    export ANDROID_API_LEVEL="${ANDROID_API_LEVEL:-34}"
+    export ARGON2_CFFI_USE_SYSTEM=1
+    export CMAKE_PREFIX_PATH="${PREFIX}"
+    export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
+    export PATH="${PREFIX}/bin:${PATH}"
+    export PIP_NO_INPUT=1
+    export CARGO_TERM_COLOR=never
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
+    (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
 
-printf '\n==> Installing Crafty %s\n' "$CRAFTY_TAG"
-mkdir -p "$C"
-if [[ ! -d "$R/.git" ]]; then
-    git clone --depth 1 --branch "$CRAFTY_TAG" https://gitlab.com/crafty-controller/crafty-4.git "$R" || err "Failed to clone Crafty $CRAFTY_TAG."
-else
-    cd "$R"
-    git fetch --depth 1 origin tag "$CRAFTY_TAG" || err "Failed to fetch Crafty $CRAFTY_TAG."
-    git checkout --force "$CRAFTY_TAG" || err "Failed to checkout Crafty $CRAFTY_TAG."
-fi
-echo '    OK: Crafty source ready'
+    echo "    Native dependencies use Termux CMake/Argon2/LLVM; build output is shown live."
+    echo "    Full pip log: ${CRAFTY_HOME}/pip-install.log"
 
-python - "$R/app/classes/helpers/helpers.py" <<'PY'
-import pathlib,sys
-p=pathlib.Path(sys.argv[1]); s=p.read_text()
-old='        for item in psutil.disk_partitions(all=False):'
-if old in s:
-    s=s.replace(old, '''        try:\n            partitions = psutil.disk_partitions(all=False)\n        except PermissionError:\n            partitions = []\n        for item in partitions:''', 1)
-    p.write_text(s)
-elif 'partitions = psutil.disk_partitions(all=False)' not in s:
-    raise SystemExit('Crafty compatibility patch target changed; refusing unsafe patch')
-PY
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir \
+        -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.txt" 2>&1 | tee "${CRAFTY_HOME}/pip-install.log"
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata 2>&1 | tee -a "${CRAFTY_HOME}/pip-install.log"
+    ok "Crafty Python dependencies are installed"
+}
 
-printf '\n==> Installing Python dependencies\n'
-[[ -x "$P" ]] || python -m venv --system-site-packages "$R/.venv" || err 'Failed to create Python virtual environment.'
-t=$(mktemp -d); trap 'rm -rf "$t"' EXIT
-grep -Ev '^(psutil|cryptography|pillow)==' "$R/requirements.txt" > "$t/requirements.txt"
-export PIP_NO_INPUT=1 CARGO_TERM_COLOR=never
-export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
-(( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
-export ARGON2_CFFI_USE_SYSTEM=1
-export CMAKE_PREFIX_PATH="$PREFIX"
-export PKG_CONFIG_PATH="$PREFIX/lib/pkgconfig"
-export PATH="$PREFIX/bin:$PATH"
+configure_shell_environment() {
+    say "Configuring Termux service environment"
+    touch "${BASHRC}"
+    grep -Fqx "export SVDIR=\"${SERVICE_DIR}\"" "${BASHRC}" || printf '\nexport SVDIR="%s"\n' "${SERVICE_DIR}" >> "${BASHRC}"
+    grep -Fqx "export LOGDIR=\"${LOGDIR}\"" "${BASHRC}" || printf 'export LOGDIR="%s"\n' "${LOGDIR}" >> "${BASHRC}"
+    ok "SVDIR is configured persistently for sv commands"
+}
 
-echo '    Using Termux system CMake/Argon2/LLVM to avoid pip building CMake from source.'
-echo '    Native/Rust-backed packages may still take several minutes on Android.'
-echo "    Live output is shown and saved to $C/pip-install.log"
-if ! "$P" -m pip install --disable-pip-version-check --prefer-binary -r "$t/requirements.txt" 2>&1 | tee "$C/pip-install.log"; then
-    echo '    ERROR: Python dependency installation failed.' >&2
-    tail -n 60 "$C/pip-install.log" >&2 || true
-    exit 1
-fi
-if ! "$P" -m pip install --disable-pip-version-check tzdata 2>&1 | tee -a "$C/pip-install.log"; then
-    echo '    ERROR: Failed to install tzdata.' >&2
-    tail -n 20 "$C/pip-install.log" >&2 || true
-    exit 1
-fi
-rm -rf "$t"; trap - EXIT
-echo '    OK: Python dependencies installed'
-
-printf '\n==> Configuring Crafty service\n'
-mkdir -p "$S/crafty/log" "$C/logs" "$HOME/minecraft" "$(dirname "$BOOT")"
-cat > "$S/crafty/run" <<EOF
-#!$PREFIX/bin/sh
-cd "$R" || exit 1
-export PYTHONUNBUFFERED=1
-exec "$P" main.py -d -i >> "$LOG" 2>&1
+configure_crafty_service() {
+    say "Configuring Crafty autostart"
+    mkdir -p "${CRAFTY_SERVICE}" "${CRAFTY_HOME}/logs" "${HOME}/minecraft"
+    cat > "${CRAFTY_SERVICE}/run" <<EOF
+#!${PREFIX}/bin/sh
+cd ${CRAFTY_REPO}
+export TZ=UTC
+exec ${CRAFTY_VENV}/bin/python main.py --daemon >> ${CRAFTY_HOME}/logs/crafty-service.log 2>&1
 EOF
-chmod 700 "$S/crafty/run"
-rm -f "$S/crafty/down"
-ln -sf "$PREFIX/share/termux-services/svlogger" "$S/crafty/log/run"
-chmod 700 "$S/crafty/log/run" 2>/dev/null || true
+    chmod 700 "${CRAFTY_SERVICE}/run"
 
-# runsvdir watches $S. It does not require a shell restart when started here.
-if ! pgrep -x runsvdir >/dev/null 2>&1; then
-    service-daemon start >/dev/null 2>&1 || true
-    sleep 2
-fi
-SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
-
-cat > "$BOOT" <<EOF
-#!$PREFIX/bin/sh
-export SVDIR="$S"
-export LOGDIR="$PREFIX/var/log"
-mkdir -p "$PREFIX/var/run" "$S"
-if [ -f "$PREFIX/etc/profile.d/start-services.sh" ]; then
-    . "$PREFIX/etc/profile.d/start-services.sh" || true
-fi
-if ! pgrep -x runsvdir >/dev/null 2>&1; then
-    service-daemon start >/dev/null 2>&1 || true
-fi
-rm -f "$S/crafty/down" "$S/sshd/down"
-SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
-SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
+    mkdir -p "${BOOT_DIR}"
+    cat > "${BOOT_SCRIPT}" <<EOF
+#!${PREFIX}/bin/sh
+export SVDIR=${SERVICE_DIR}
+export LOGDIR=${LOGDIR}
+sv up sshd >/dev/null 2>&1 || true
+sv up crafty >/dev/null 2>&1 || true
 EOF
-chmod 700 "$BOOT"
+    chmod 700 "${BOOT_SCRIPT}"
 
-printf '\n==> Verifying Crafty\n'
-started=0
-for i in {1..60}; do
-    if SVDIR="$S" sv status crafty 2>/dev/null | grep -q '^run:'; then started=1; break; fi
-    sleep 1
-done
-if (( ! started )); then
-    echo '    ERROR: Crafty failed to start.' >&2
-    echo "    Service directory: $S/crafty" >&2
-    ls -la "$S/crafty" 2>&1 || true
-    echo '    Service status:' >&2
-    SVDIR="$S" sv status crafty 2>&1 || true
-    echo '    Run script syntax:' >&2
-    "$PREFIX/bin/sh" -n "$S/crafty/run" 2>&1 || true
-    echo '    Crafty log:' >&2
-    tail -n 80 "$LOG" 2>/dev/null || true
-    echo '    Runit log:' >&2
-    tail -n 80 "$PREFIX/var/log/sv/crafty/current" 2>/dev/null || true
-    exit 1
-fi
-echo '    OK: Crafty service is running'
+    for _ in {1..5}; do
+        sv up crafty >/dev/null 2>&1 && break
+        sleep 2
+    done
+    sv status crafty >/dev/null 2>&1 || die "Unable to start Crafty through termux-services."
+    ok "Crafty service is enabled and running"
+    ok "Termux:Boot hook installed at ${BOOT_SCRIPT}"
+}
 
-grep -Fqx "export SVDIR=\"$S\"" "$HOME/.bashrc" 2>/dev/null || echo "export SVDIR=\"$S\"" >> "$HOME/.bashrc"
-grep -Fqx "export LOGDIR=\"$PREFIX/var/log\"" "$HOME/.bashrc" 2>/dev/null || echo "export LOGDIR=\"$PREFIX/var/log\"" >> "$HOME/.bashrc"
+verify() {
+    say "Verifying installation"
+    [[ -x "${PREFIX}/bin/sshd" ]] || die "SSHD executable is missing."
+    [[ -x "${CRAFTY_VENV}/bin/python" && -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty installation is incomplete."
+    [[ -x "${CRAFTY_SERVICE}/run" && -x "${BOOT_SCRIPT}" ]] || die "Crafty autostart files are missing."
 
-printf '\n==> Verifying HTTPS endpoint\n'
-ready=0
-for i in {1..60}; do
-    if curl -ksf --connect-timeout 1 --max-time 2 https://127.0.0.1:8443/ >/dev/null 2>&1; then ready=1; break; fi
-    sleep 1
-done
-if (( ! ready )); then
-    echo '    ERROR: Crafty HTTPS endpoint is not responding.' >&2
-    tail -n 80 "$LOG" 2>/dev/null || true
-    exit 1
-fi
-echo '    OK: Crafty HTTPS endpoint is responding'
+    for _ in {1..10}; do
+        curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
+        sleep 3
+    done
+    curl -kfsS -o /dev/null https://127.0.0.1:8443/ || die "Crafty HTTPS check failed."
+    ok "Crafty HTTPS endpoint is responding"
+}
 
-ip=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')
-[[ -n "$ip" ]] || ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-[[ -n "$ip" ]] || ip="127.0.0.1"
-user=admin; pass=Unavailable
-if [[ -f "$CREDS" ]]; then
-    read -r user pass < <("$P" - "$CREDS" <<'PY'
-import json,sys
-x=json.load(open(sys.argv[1])); print(x.get('username','admin'),x.get('password','Unavailable'))
+show_success() {
+    local device_ip username password
+    device_ip="$(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "${device_ip}" && "${device_ip}" != "127.0.0.1" ]] || device_ip="DEVICE_IP"
+
+    username="admin"
+    password="Unavailable"
+    if [[ -f "${CRAFTY_CREDS}" ]]; then
+        read -r username password < <("${CRAFTY_VENV}/bin/python" - "${CRAFTY_CREDS}" <<'PY'
+import json
+import pathlib
+import sys
+c = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
+print(c.get("username", "admin"), c.get("password", "Unavailable"))
 PY
 )
-fi
+    fi
 
-printf '\n========================================\n  CRAFTY INSTALLATION COMPLETE\n========================================\n'
-printf 'Crafty     : %s\nDashboard   : https://%s:8443\nUsername    : %s\nPassword    : %s\n' "$CRAFTY_TAG" "$ip" "$user" "$pass"
-printf '========================================\n\nSSHD status:\n'; SVDIR="$S" sv status sshd 2>&1 || true
-printf '\nCrafty status:\n'; SVDIR="$S" sv status crafty
-printf '\nCrafty log: %s\nService log: %s\nCredentials: %s\n' "$LOG" "$PREFIX/var/log/sv/crafty/current" "$CREDS"
+    printf '\n========================================\n'
+    printf '       CRAFTY INSTALLATION COMPLETE\n'
+    printf '========================================\n'
+    printf 'Version   : %s\n' "${CRAFTY_TAG}"
+    printf 'Dashboard : https://%s:8443\n' "${device_ip}"
+    printf 'Username  : %s\n' "${username}"
+    printf 'Password  : %s\n' "${password}"
+    printf '========================================\n\n'
+    printf 'SSHD status:\n'
+    sv status sshd
+    printf '\nCrafty status:\n'
+    sv status crafty
+    printf '\nCrafty directory: %s\n' "${CRAFTY_REPO}"
+    printf 'Credentials file: %s\n' "${CRAFTY_CREDS}"
+    printf 'Pip build log: %s\n' "${CRAFTY_HOME}/pip-install.log"
+}
+
+main() {
+    require_termux
+    install_packages
+    configure_sshd
+    clone_or_update_crafty
+    patch_for_termux
+    install_python_dependencies
+    configure_shell_environment
+    configure_crafty_service
+    verify
+    show_success
+}
+
+main "$@"
