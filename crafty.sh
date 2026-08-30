@@ -13,6 +13,9 @@ err(){ echo "    ERROR: $*" >&2; exit 1; }
 printf '\n==> Installing packages\n'
 pkg update -y || err "Package index update failed. Run 'pkg update' and try again."
 pkg install -y openssh termux-services curl git python clang llvm rust cmake pkg-config libffi openssl argon2 python-psutil python-cryptography python-pillow openjdk-21 || err "Package installation failed."
+# Reinstall OpenSSH so its current Termux service definition is present even when
+# OpenSSH was installed before termux-services.
+pkg reinstall -y openssh >/dev/null 2>&1 || true
 echo '    OK: Packages installed'
 
 python - <<'PY' || err 'Python 3.9+ is required.'
@@ -21,16 +24,35 @@ if sys.version_info < (3, 9):
     raise SystemExit(f"Python 3.9+ required; found {sys.version.split()[0]}")
 PY
 
+# termux-services normally initializes these after a shell restart. Do it here
+# explicitly so the installer works in the same Termux session.
 mkdir -p "$S" "$PREFIX/var/log" "$PREFIX/var/run" "$C/logs"
 export SVDIR="$S" LOGDIR="$PREFIX/var/log"
-service-daemon start >/dev/null 2>&1 || true
-sleep 1
-sv-enable sshd >/dev/null 2>&1 || true
-if ! sv status sshd 2>/dev/null | grep -q '^run:'; then
-    sv up sshd >/dev/null 2>&1 || true
+if [[ -f "$PREFIX/etc/profile.d/start-services.sh" ]]; then
+    # shellcheck disable=SC1091
+    . "$PREFIX/etc/profile.d/start-services.sh" || true
 fi
-sv status sshd 2>/dev/null | grep -q '^run:' || err 'Failed to start SSHD. Run: sv status sshd'
-echo '    OK: SSHD is running'
+# The profile script may launch service-daemon asynchronously.
+if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
+    service-daemon start >/dev/null 2>&1 || true
+fi
+sleep 2
+
+# OpenSSH's package owns its service directory. Restore it if it is missing.
+if [[ ! -d "$S/sshd" ]]; then
+    pkg reinstall -y openssh >/dev/null 2>&1 || true
+fi
+if [[ -d "$S/sshd" ]]; then
+    rm -f "$S/sshd/down"
+    SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
+    if ! SVDIR="$S" sv status sshd 2>/dev/null | grep -q '^run:'; then
+        echo '    WARNING: SSHD service exists but is not running; continuing with Crafty.'
+    else
+        echo '    OK: SSHD is running'
+    fi
+else
+    echo '    WARNING: SSHD service definition is unavailable; continuing with Crafty.'
+fi
 
 printf '\n==> Installing Crafty %s\n' "$CRAFTY_TAG"
 mkdir -p "$C"
@@ -95,33 +117,41 @@ rm -f "$S/crafty/down"
 ln -sf "$PREFIX/share/termux-services/svlogger" "$S/crafty/log/run"
 chmod 700 "$S/crafty/log/run" 2>/dev/null || true
 
-# Start the runit supervisor again after creating the service. This also works
-# when the installer is run in an already-open Termux session.
-service-daemon restart >/dev/null 2>&1 || service-daemon start >/dev/null 2>&1 || true
-sleep 2
-sv up crafty >/dev/null 2>&1 || true
+# Make sure the supervisor is actually watching the service directory.
+if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
+    service-daemon start >/dev/null 2>&1 || true
+    sleep 2
+fi
+SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
 
 cat > "$BOOT" <<EOF
 #!$PREFIX/bin/sh
 export SVDIR="$S" LOGDIR="$PREFIX/var/log"
-mkdir -p "$PREFIX/var/run"
-service-daemon start >/dev/null 2>&1 || true
+mkdir -p "$PREFIX/var/run" "$S"
+if [[ -f "$PREFIX/etc/profile.d/start-services.sh" ]]; then
+    . "$PREFIX/etc/profile.d/start-services.sh" || true
+fi
+if ! pgrep -f "$PREFIX/bin/runsvdir" >/dev/null 2>&1; then
+    service-daemon start >/dev/null 2>&1 || true
+fi
 rm -f "$S/crafty/down"
-sv up crafty >/dev/null 2>&1 || true
-sv-enable sshd >/dev/null 2>&1 || true
+SVDIR="$S" sv up crafty >/dev/null 2>&1 || true
+SVDIR="$S" sv up sshd >/dev/null 2>&1 || true
 EOF
 chmod 700 "$BOOT"
 
 printf '\n==> Verifying Crafty\n'
 started=0
 for i in {1..60}; do
-    if sv status crafty 2>/dev/null | grep -q '^run:'; then started=1; break; fi
+    if SVDIR="$S" sv status crafty 2>/dev/null | grep -q '^run:'; then started=1; break; fi
     sleep 1
 done
 if (( ! started )); then
     echo '    ERROR: Crafty failed to start.' >&2
+    echo "    Service directory: $S/crafty" >&2
+    ls -la "$S/crafty" 2>&1 || true
     echo '    Service status:' >&2
-    sv status crafty 2>&1 || true
+    SVDIR="$S" sv status crafty 2>&1 || true
     echo '    Run script syntax:' >&2
     "$PREFIX/bin/sh" -n "$S/crafty/run" 2>&1 || true
     echo '    Crafty log:' >&2
@@ -162,6 +192,6 @@ fi
 
 printf '\n========================================\n  CRAFTY INSTALLATION COMPLETE\n========================================\n'
 printf 'Crafty     : %s\nDashboard   : https://%s:8443\nUsername    : %s\nPassword    : %s\n' "$CRAFTY_TAG" "$ip" "$user" "$pass"
-printf '========================================\n\nSSHD status:\n'; sv status sshd
-printf '\nCrafty status:\n'; sv status crafty
+printf '========================================\n\nSSHD status:\n'; SVDIR="$S" sv status sshd 2>&1 || true
+printf '\nCrafty status:\n'; SVDIR="$S" sv status crafty
 printf '\nCrafty log: %s\nService log: %s\nCredentials: %s\n' "$LOG" "$PREFIX/var/log/sv/crafty/current" "$CREDS"
