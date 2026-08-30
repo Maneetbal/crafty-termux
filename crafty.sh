@@ -23,19 +23,18 @@ say() { printf '\n==> %s\n' "$*"; }
 ok() { printf '    OK: %s\n' "$*"; }
 warn() { printf '    WARNING: %s\n' "$*" >&2; }
 die() { printf '    ERROR: %s\n' "$*" >&2; exit 1; }
-cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "${TMP_DIR}"; }
+cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "$TMP_DIR"; }
 trap cleanup EXIT
 
 require_termux() {
     [[ -n "${PREFIX:-}" && -x "${PREFIX}/bin/pkg" ]] || die "This script must run inside Termux."
-    [[ "$(uname -o 2>/dev/null || true)" == "Android" ]] || warn "Host is not identified as Android; continuing because PREFIX is valid."
 }
 
 install_packages() {
     say "Installing required Termux packages"
-    pkg update -y || die "Package index update failed."
+    pkg update -y
     pkg install -y openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
-        python-psutil python-cryptography python-pillow openjdk-21 || die "Required Termux packages could not be installed."
+        python-psutil python-cryptography python-pillow openjdk-21
     ok "Termux packages are installed"
 }
 
@@ -51,7 +50,7 @@ configure_sshd() {
         ok "SSHD service is enabled and running"
     else
         warn "The termux-services SSHD service was not created automatically."
-        warn "Run: sv-enable sshd"
+        warn "Continuing; Crafty does not require SSHD to run."
     fi
 }
 
@@ -59,19 +58,16 @@ clone_or_update_crafty() {
     say "Installing Crafty Controller ${CRAFTY_TAG}"
     mkdir -p "${CRAFTY_HOME}"
     if [[ ! -d "${CRAFTY_REPO}/.git" ]]; then
-        git clone --depth 1 --branch "${CRAFTY_TAG}" https://gitlab.com/crafty-controller/crafty-4.git "${CRAFTY_REPO}" || \
-            die "Failed to clone Crafty ${CRAFTY_TAG}."
-    elif git -C "${CRAFTY_REPO}" diff --quiet && git -C "${CRAFTY_REPO}" diff --cached --quiet; then
-        git fetch --depth 1 origin tag "${CRAFTY_TAG}" || die "Failed to fetch Crafty ${CRAFTY_TAG}."
-        git checkout --force "${CRAFTY_TAG}" || die "Failed to checkout Crafty ${CRAFTY_TAG}."
+        git clone --depth 1 --branch "${CRAFTY_TAG}" https://gitlab.com/crafty-controller/crafty-4.git "${CRAFTY_REPO}"
     else
-        warn "Local Crafty changes detected; leaving them untouched."
+        git -C "${CRAFTY_REPO}" fetch --depth 1 origin tag "${CRAFTY_TAG}"
+        git -C "${CRAFTY_REPO}" checkout --force "${CRAFTY_TAG}"
     fi
     ok "Crafty source is present at ${CRAFTY_REPO}"
 }
 
 patch_for_termux() {
-    say "Applying the Android compatibility patch"
+    say "Applying Android compatibility patch"
     python - "${CRAFTY_REPO}/app/classes/helpers/helpers.py" <<'PY'
 import pathlib
 import sys
@@ -106,17 +102,13 @@ install_python_dependencies() {
     export CMAKE_PREFIX_PATH="${PREFIX}"
     export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
     export PATH="${PREFIX}/bin:${PATH}"
-    export PIP_NO_INPUT=1
-    export CARGO_TERM_COLOR=never
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
     (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
 
-    echo "    Native dependencies use Termux CMake/Argon2/LLVM; build output is shown live."
-    echo "    Full pip log: ${CRAFTY_HOME}/pip-install.log"
-
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir \
-        -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.txt" 2>&1 | tee "${CRAFTY_HOME}/pip-install.log"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata 2>&1 | tee -a "${CRAFTY_HOME}/pip-install.log"
+    echo "    Installing native dependencies from Termux where available"
+    echo "    Live pip output is shown below"
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -c "${TMP_DIR}/constraints.txt" -r "${TMP_DIR}/requirements.txt"
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
     ok "Crafty Python dependencies are installed"
 }
 
@@ -193,18 +185,15 @@ PY
     printf '\n========================================\n'
     printf '       CRAFTY INSTALLATION COMPLETE\n'
     printf '========================================\n'
-    printf 'Version   : %s\n' "${CRAFTY_TAG}"
     printf 'Dashboard : https://%s:8443\n' "${device_ip}"
     printf 'Username  : %s\n' "${username}"
     printf 'Password  : %s\n' "${password}"
     printf '========================================\n\n'
     printf 'SSHD status:\n'
-    sv status sshd
+    sv status sshd 2>/dev/null || true
     printf '\nCrafty status:\n'
     sv status crafty
-    printf '\nCrafty directory: %s\n' "${CRAFTY_REPO}"
-    printf 'Credentials file: %s\n' "${CRAFTY_CREDS}"
-    printf 'Pip build log: %s\n' "${CRAFTY_HOME}/pip-install.log"
+    printf '\nCredentials file: %s\n' "${CRAFTY_CREDS}"
 }
 
 main() {
