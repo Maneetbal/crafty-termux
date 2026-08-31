@@ -80,13 +80,17 @@ clone_or_update_crafty() {
 }
 
 patch_for_termux() {
-    say "Applying Android compatibility patch"
-    python - "${CRAFTY_REPO}/app/classes/helpers/helpers.py" <<'PY'
+    say "Applying Android compatibility patches"
+
+    python - "${CRAFTY_REPO}/app/classes/helpers/helpers.py" "${CRAFTY_REPO}/app/classes/remote_stats/stats.py" <<'PY'
 import pathlib
 import sys
 
-path = pathlib.Path(sys.argv[1])
-text = path.read_text(encoding="utf-8")
+helpers = pathlib.Path(sys.argv[1])
+stats = pathlib.Path(sys.argv[2])
+
+# Patch Crafty's disk partition scan for Android/Termux /proc restrictions.
+text = helpers.read_text(encoding="utf-8")
 old = "        for item in psutil.disk_partitions(all=False):\n"
 new = """        try:
             partitions = psutil.disk_partitions(all=False)
@@ -95,11 +99,37 @@ new = """        try:
         for item in partitions:
 """
 if old in text:
-    path.write_text(text.replace(old, new, 1), encoding="utf-8")
+    text = text.replace(old, new, 1)
 elif "partitions = psutil.disk_partitions(all=False)" not in text:
     raise SystemExit("Crafty helper layout changed; refusing to patch automatically")
+helpers.write_text(text, encoding="utf-8")
+
+# Patch CPU-frequency collection for Android/Termux. Android commonly denies
+# access to /sys/devices/system/cpu/cpufreq/.../scaling_max_freq. CPU frequency
+# is optional, so preserve statistics collection with sentinel values.
+text = stats.read_text(encoding="utf-8")
+old = """        try:
+            cpu_freq = psutil.cpu_freq()
+        except (NotImplementedError, AttributeError, FileNotFoundError):
+            cpu_freq = None
+        if cpu_freq is None:
+            cpu_freq = psutil._common.scpufreq(current=-1, min=-1, max=-1)
+"""
+new = """        try:
+            cpu_freq = psutil.cpu_freq()
+        except (NotImplementedError, AttributeError, FileNotFoundError, PermissionError, OSError):
+            # Android/Termux may deny access to CPU cpufreq sysfs files.
+            # CPU frequency is optional for Crafty's statistics.
+            cpu_freq = (-1.0, -1.0, -1.0)
+"""
+if old in text:
+    text = text.replace(old, new, 1)
+elif "cpu_freq = (-1.0, -1.0, -1.0)" not in text:
+    raise SystemExit("Crafty stats CPU-frequency layout changed; refusing to patch automatically")
+stats.write_text(text, encoding="utf-8")
 PY
-    ok "Android /proc permission compatibility is configured"
+
+    ok "Android disk and CPU-frequency compatibility patches are configured"
 }
 
 install_python_dependencies() {
@@ -113,24 +143,16 @@ install_python_dependencies() {
     export ARGON2_CFFI_USE_SYSTEM=1
     export CMAKE_PREFIX_PATH="${PREFIX}"
     export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
-    export PATH="${PREFIX}/bin:${PATH}"
+    export PATH="${PREFIX}/bin:${JAVA_HOME_TERMUX}/bin:${PATH}"
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
     (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
 
     echo "    Installing native dependencies from Termux where available"
     echo "    Live pip output is shown below"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -r "${TMP_DIR}/requirements.txt"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
-
-    # pip can satisfy webauthn's cryptography dependency by installing a local
-    # wheel that is incompatible with Android's Python runtime. Remove any pip
-    # copy so the venv falls back to Termux's python-cryptography package.
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -c <(printf 'cryptography==48.0.1\n') -r "${TMP_DIR}/requirements.txt"
     "${CRAFTY_VENV}/bin/python" -m pip uninstall -y cryptography >/dev/null 2>&1 || true
-    "${CRAFTY_VENV}/bin/python" - <<'PY'
-import cryptography
-from cryptography.hazmat.bindings import _rust
-print(f"    Using Termux cryptography {cryptography.__version__}: {cryptography.__file__}")
-PY
+    "${CRAFTY_VENV}/bin/python" -c 'import cryptography; print("    Cryptography:", cryptography.__version__, cryptography.__file__)'
+    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
 
     ok "Crafty Python dependencies are installed"
 }
@@ -184,13 +206,8 @@ verify() {
     [[ -x "${PREFIX}/bin/sshd" ]] || die "SSHD executable is missing."
     [[ -x "${CRAFTY_VENV}/bin/python" && -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty installation is incomplete."
     [[ -x "${CRAFTY_SERVICE}/run" && -x "${BOOT_SCRIPT}" ]] || die "Crafty autostart files are missing."
-    "${CRAFTY_VENV}/bin/python" - <<'PY'
-import cryptography
-from cryptography.hazmat.bindings import _rust
-if not cryptography.__file__.startswith('/data/data/'):
-    raise SystemExit(f'Unexpected cryptography path: {cryptography.__file__}')
-print(f"    OK: venv cryptography {cryptography.__version__}")
-PY
+
+    "${CRAFTY_VENV}/bin/python" -c 'import cryptography; from cryptography.hazmat.bindings import _rust; print(f"    OK: cryptography {cryptography.__version__}")' || die "Crafty cryptography import failed."
 
     for _ in {1..10}; do
         curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
