@@ -60,6 +60,12 @@ configure_sshd() {
     say "Configuring SSHD"
     [[ -x "${PREFIX}/bin/sshd" ]] || die "OpenSSH/SSHD was not installed."
 
+    if pgrep -x sshd >/dev/null 2>&1; then
+        warn "An existing SSHD is already running; leaving it untouched."
+        ok "Existing SSHD is running"
+        return
+    fi
+
     mkdir -p "${SERVICE_DIR}" "${LOGDIR}"
 
     if command -v service-daemon >/dev/null 2>&1; then
@@ -406,7 +412,11 @@ PY
     printf 'Password  : %s\n' "${password}"
     printf '========================================\n\n'
     printf 'SSHD status:\n'
-    sv status sshd 2>/dev/null || true
+    if pgrep -x sshd >/dev/null 2>&1; then
+        printf 'run: existing sshd process\n'
+    else
+        sv status sshd 2>/dev/null || true
+    fi
     printf '\nCrafty status:\n'
     sv status crafty
     printf '\nCredentials file: %s\n' "${CRAFTY_CREDS}"
