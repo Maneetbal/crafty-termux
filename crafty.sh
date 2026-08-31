@@ -238,7 +238,6 @@ configure_shell_environment() {
         printf 'export PATH="$JAVA_HOME/bin:$PATH"\n' >> "${BASHRC}"
 
     export SVDIR="${SERVICE_DIR}"
-    export LOGDIR="${LOGDIR}"
     export JAVA_HOME="${JAVA_HOME_TERMUX}"
     export PATH="${JAVA_HOME}/bin:${PATH}"
 
