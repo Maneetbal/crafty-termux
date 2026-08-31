@@ -13,6 +13,8 @@ readonly BOOT_DIR="${HOME}/.termux/boot"
 readonly BOOT_SCRIPT="${BOOT_DIR}/start-crafty"
 readonly BASHRC="${HOME}/.bashrc"
 readonly LOGDIR="${PREFIX:-}/var/log"
+readonly PIP_LOG="${CRAFTY_HOME}/pip-install.log"
+readonly CRAFTY_DB="${CRAFTY_REPO}/app/config/db/crafty.sqlite"
 readonly CRAFTY_TAG="v4.10.8"
 readonly JAVA_HOME_TERMUX="${PREFIX:-}/lib/jvm/java-25-openjdk"
 
@@ -24,17 +26,18 @@ say() { printf '\n==> %s\n' "$*"; }
 ok() { printf '    OK: %s\n' "$*"; }
 warn() { printf '    WARNING: %s\n' "$*" >&2; }
 die() { printf '    ERROR: %s\n' "$*" >&2; exit 1; }
-cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "$TMP_DIR"; }
+cleanup() { [[ -n "${TMP_DIR}" && -d "${TMP_DIR}" ]] && rm -rf -- "${TMP_DIR}"; }
 trap cleanup EXIT
 
 require_termux() {
     [[ -n "${PREFIX:-}" && -x "${PREFIX}/bin/pkg" ]] || die "This script must run inside Termux."
+    [[ "$(uname -o 2>/dev/null || true)" == "Android" ]] || warn "Host is not identified as Android; continuing because PREFIX is valid."
 }
 
 install_packages() {
     say "Installing required Termux packages"
     pkg update -y
-    pkg install -y openssh termux-services curl git python clang llvm make openssl rust cmake pkg-config argon2 \
+    pkg install -y openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
         python-psutil python-cryptography python-pillow openjdk-25
     ok "Termux packages are installed"
 }
@@ -42,18 +45,22 @@ install_packages() {
 configure_java() {
     say "Configuring Java 25"
     [[ -x "${JAVA_HOME_TERMUX}/bin/java" ]] || die "OpenJDK 25 is not installed correctly."
+
     export JAVA_HOME="${JAVA_HOME_TERMUX}"
     export PATH="${JAVA_HOME}/bin:${PATH}"
     hash -r 2>/dev/null || true
+
     local java_version
     java_version="$(java -version 2>&1 | awk -F'"' '/version/ {print $2; exit}')"
     [[ "$java_version" == 25.* ]] || die "Java 25 is required for current Velocity builds; found ${java_version:-unknown}."
+
     ok "Java 25 is the active runtime (${java_version})"
 }
 
 configure_sshd() {
     say "Configuring SSHD"
     [[ -x "${PREFIX}/bin/sshd" ]] || die "OpenSSH/SSHD was not installed."
+
     mkdir -p "${SERVICE_DIR}" "${LOGDIR}"
     command -v service-daemon >/dev/null 2>&1 && service-daemon start >/dev/null 2>&1 || true
     command -v sv-enable >/dev/null 2>&1 && sv-enable sshd >/dev/null 2>&1 || true
@@ -63,19 +70,25 @@ configure_sshd() {
         ok "SSHD service is enabled and running"
     else
         warn "The termux-services SSHD service was not created automatically."
-        warn "Continuing; Crafty does not require SSHD to run."
+        warn "Crafty does not require SSHD, so installation will continue."
     fi
 }
 
 clone_or_update_crafty() {
     say "Installing Crafty Controller ${CRAFTY_TAG}"
     mkdir -p "${CRAFTY_HOME}"
+
     if [[ ! -d "${CRAFTY_REPO}/.git" ]]; then
         git clone --depth 1 --branch "${CRAFTY_TAG}" https://gitlab.com/crafty-controller/crafty-4.git "${CRAFTY_REPO}"
     else
-        git -C "${CRAFTY_REPO}" fetch --depth 1 origin tag "${CRAFTY_TAG}"
-        git -C "${CRAFTY_REPO}" checkout --force "${CRAFTY_TAG}"
+        git -C "${CRAFTY_REPO}" fetch --depth 1 origin "refs/tags/${CRAFTY_TAG}:refs/tags/${CRAFTY_TAG}"
+        if git -C "${CRAFTY_REPO}" diff --quiet && git -C "${CRAFTY_REPO}" diff --cached --quiet; then
+            git -C "${CRAFTY_REPO}" checkout --force "${CRAFTY_TAG}"
+        else
+            warn "Local Crafty changes detected; leaving them untouched."
+        fi
     fi
+
     ok "Crafty source is present at ${CRAFTY_REPO}"
 }
 
@@ -89,24 +102,31 @@ import sys
 helpers = pathlib.Path(sys.argv[1])
 stats = pathlib.Path(sys.argv[2])
 
-# Patch Crafty's disk partition scan for Android/Termux /proc restrictions.
+# ------------------------------------------------------------
+# Disk partition access: Android/Termux may deny individual
+# /proc or filesystem entries. An unavailable disk entry should
+# not prevent Crafty from starting.
+# ------------------------------------------------------------
 text = helpers.read_text(encoding="utf-8")
 old = "        for item in psutil.disk_partitions(all=False):\n"
 new = """        try:
             partitions = psutil.disk_partitions(all=False)
-        except PermissionError:
+        except (PermissionError, FileNotFoundError, OSError):
             partitions = []
         for item in partitions:
 """
-if old in text:
-    text = text.replace(old, new, 1)
-elif "partitions = psutil.disk_partitions(all=False)" not in text:
-    raise SystemExit("Crafty helper layout changed; refusing to patch automatically")
-helpers.write_text(text, encoding="utf-8")
 
-# Patch CPU-frequency collection for Android/Termux. Android commonly denies
-# access to /sys/devices/system/cpu/cpufreq/.../scaling_max_freq. CPU frequency
-# is optional, so preserve statistics collection with sentinel values.
+if old in text:
+    helpers.write_text(text.replace(old, new, 1), encoding="utf-8")
+elif "partitions = psutil.disk_partitions(all=False)" not in text:
+    raise SystemExit("Crafty disk-partition code changed; refusing to patch automatically")
+
+# ------------------------------------------------------------
+# CPU frequency access: Android commonly denies
+# /sys/devices/system/cpu/cpufreq/.../scaling_max_freq.
+# CPU frequency is optional, so unavailable values are represented
+# with a sentinel tuple that matches the indexing Crafty expects.
+# ------------------------------------------------------------
 text = stats.read_text(encoding="utf-8")
 old = """        try:
             cpu_freq = psutil.cpu_freq()
@@ -122,13 +142,14 @@ new = """        try:
             # CPU frequency is optional for Crafty's statistics.
             cpu_freq = (-1.0, -1.0, -1.0)
 """
+
 if old in text:
-    text = text.replace(old, new, 1)
+    stats.write_text(text.replace(old, new, 1), encoding="utf-8")
 elif "cpu_freq = (-1.0, -1.0, -1.0)" not in text:
-    raise SystemExit("Crafty stats CPU-frequency layout changed; refusing to patch automatically")
-stats.write_text(text, encoding="utf-8")
+    raise SystemExit("Crafty CPU-frequency code changed; refusing to patch automatically")
 PY
 
+    "${CRAFTY_VENV}/bin/python" -m py_compile "${CRAFTY_REPO}/app/classes/helpers/helpers.py" "${CRAFTY_REPO}/app/classes/remote_stats/stats.py"
     ok "Android disk and CPU-frequency compatibility patches are configured"
 }
 
@@ -147,12 +168,32 @@ install_python_dependencies() {
     export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
     (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
 
-    echo "    Installing native dependencies from Termux where available"
-    echo "    Live pip output is shown below"
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir -c <(printf 'cryptography==48.0.1\n') -r "${TMP_DIR}/requirements.txt"
+    mkdir -p "${CRAFTY_HOME}"
+    : > "${PIP_LOG}"
+
+    echo "    Native dependencies are provided by Termux where possible"
+    echo "    Pip output is shown live and saved to ${PIP_LOG}"
+
+    if ! "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir \
+        -c <(printf 'cryptography==48.0.1\n') \
+        -r "${TMP_DIR}/requirements.txt" 2>&1 | tee -a "${PIP_LOG}"; then
+        die "Python dependency installation failed. See ${PIP_LOG}"
+    fi
+
+    if ! "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata 2>&1 | tee -a "${PIP_LOG}"; then
+        die "tzdata installation failed. See ${PIP_LOG}"
+    fi
+
+    # Do not leave a pip-built cryptography module shadowing Termux's
+    # Android-compatible system package.
     "${CRAFTY_VENV}/bin/python" -m pip uninstall -y cryptography >/dev/null 2>&1 || true
-    "${CRAFTY_VENV}/bin/python" -c 'import cryptography; print("    Cryptography:", cryptography.__version__, cryptography.__file__)'
-    "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir tzdata
+
+    "${CRAFTY_VENV}/bin/python" - <<'PY'
+import cryptography
+from cryptography.hazmat.bindings import _rust
+print(f"    OK: cryptography {cryptography.__version__}")
+print(f"    OK: cryptography path {cryptography.__file__}")
+PY
 
     ok "Crafty Python dependencies are installed"
 }
@@ -160,16 +201,31 @@ install_python_dependencies() {
 configure_shell_environment() {
     say "Configuring Termux service environment"
     touch "${BASHRC}"
-    grep -Fqx "export SVDIR=\"${SERVICE_DIR}\"" "${BASHRC}" || printf '\nexport SVDIR="%s"\n' "${SERVICE_DIR}" >> "${BASHRC}"
-    grep -Fqx "export LOGDIR=\"${LOGDIR}\"" "${BASHRC}" || printf 'export LOGDIR="%s"\n' "${LOGDIR}" >> "${BASHRC}"
-    grep -Fqx "export JAVA_HOME=\"${JAVA_HOME_TERMUX}\"" "${BASHRC}" || printf 'export JAVA_HOME="%s"\n' "${JAVA_HOME_TERMUX}" >> "${BASHRC}"
-    grep -Fqx 'export PATH="$JAVA_HOME/bin:$PATH"' "${BASHRC}" || printf 'export PATH="$JAVA_HOME/bin:$PATH"\n' >> "${BASHRC}"
+
+    grep -Fqx "export SVDIR=\"${SERVICE_DIR}\"" "${BASHRC}" || \
+        printf '\nexport SVDIR="%s"\n' "${SERVICE_DIR}" >> "${BASHRC}"
+
+    grep -Fqx "export LOGDIR=\"${LOGDIR}\"" "${BASHRC}" || \
+        printf 'export LOGDIR="%s"\n' "${LOGDIR}" >> "${BASHRC}"
+
+    grep -Fqx "export JAVA_HOME=\"${JAVA_HOME_TERMUX}\"" "${BASHRC}" || \
+        printf 'export JAVA_HOME="%s"\n' "${JAVA_HOME_TERMUX}" >> "${BASHRC}"
+
+    grep -Fqx 'export PATH="$JAVA_HOME/bin:$PATH"' "${BASHRC}" || \
+        printf 'export PATH="$JAVA_HOME/bin:$PATH"\n' >> "${BASHRC}"
+
+    export SVDIR="${SERVICE_DIR}"
+    export LOGDIR="${LOGDIR}"
+    export JAVA_HOME="${JAVA_HOME_TERMUX}"
+    export PATH="${JAVA_HOME}/bin:${PATH}"
+
     ok "SVDIR, LOGDIR, and Java 25 are configured persistently"
 }
 
 configure_crafty_service() {
     say "Configuring Crafty autostart"
     mkdir -p "${CRAFTY_SERVICE}" "${CRAFTY_HOME}/logs" "${HOME}/minecraft"
+
     cat > "${CRAFTY_SERVICE}/run" <<EOF
 #!${PREFIX}/bin/sh
 cd ${CRAFTY_REPO}
@@ -192,44 +248,122 @@ sv up crafty >/dev/null 2>&1 || true
 EOF
     chmod 700 "${BOOT_SCRIPT}"
 
-    for _ in {1..5}; do
-        sv up crafty >/dev/null 2>&1 && break
+    for _ in {1..10}; do
+        if sv up crafty >/dev/null 2>&1; then
+            break
+        fi
         sleep 2
     done
+
     sv status crafty >/dev/null 2>&1 || die "Unable to start Crafty through termux-services."
     ok "Crafty service is enabled and running"
     ok "Termux:Boot hook installed at ${BOOT_SCRIPT}"
 }
 
+wait_for_initialization() {
+    say "Waiting for Crafty initialization"
+
+    for _ in {1..90}; do
+        if grep -q "Crafty has fully started and is now ready for use!" "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null; then
+            ok "Crafty application is fully initialized"
+            return
+        fi
+
+        if grep -q "Server Init Complete: Listening For Connections!" "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null; then
+            ok "Crafty web server is initialized"
+            return
+        fi
+
+        sleep 1
+    done
+
+    warn "Crafty did not print its full initialization message within 90 seconds."
+    tail -n 80 "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null || true
+}
+
+verify_host_stats() {
+    say "Verifying HostStats collection"
+
+    [[ -f "${CRAFTY_DB}" ]] || {
+        warn "Crafty database is not visible yet; continuing with application checks."
+        return
+    }
+
+    for _ in {1..90}; do
+        local result
+        result="$(${CRAFTY_VENV}/bin/python - "${CRAFTY_DB}" <<'PY'
+import sqlite3
+import sys
+
+try:
+    con = sqlite3.connect(sys.argv[1], timeout=5)
+    row = con.execute("SELECT COUNT(*) FROM host_stats").fetchone()
+    print(row[0])
+    con.close()
+except Exception:
+    print("0")
+PY
+)"
+
+        if [[ "${result}" =~ ^[0-9]+$ ]] && (( result > 0 )); then
+            ok "HostStats collection is working (${result} row(s))"
+            return
+        fi
+
+        sleep 1
+    done
+
+    warn "No HostStats row appeared after 90 seconds."
+    warn "This normally indicates a host-metrics problem, so the installer will show the relevant log."
+    grep -n -A18 -B3 "Exception in thread tasks_starter\|PermissionError\|record_stats" \
+        "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null | tail -100 || true
+    die "Crafty statistics collection did not initialize."
+}
+
 verify() {
     say "Verifying installation"
+
     [[ -x "${PREFIX}/bin/sshd" ]] || die "SSHD executable is missing."
-    [[ -x "${CRAFTY_VENV}/bin/python" && -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty installation is incomplete."
-    [[ -x "${CRAFTY_SERVICE}/run" && -x "${BOOT_SCRIPT}" ]] || die "Crafty autostart files are missing."
+    [[ -x "${CRAFTY_VENV}/bin/python" ]] || die "Crafty Python environment is missing."
+    [[ -f "${CRAFTY_REPO}/main.py" ]] || die "Crafty main.py is missing."
+    [[ -x "${CRAFTY_SERVICE}/run" ]] || die "Crafty service file is missing."
+    [[ -x "${BOOT_SCRIPT}" ]] || die "Termux:Boot hook is missing."
 
-    "${CRAFTY_VENV}/bin/python" -c 'import cryptography; from cryptography.hazmat.bindings import _rust; print(f"    OK: cryptography {cryptography.__version__}")' || die "Crafty cryptography import failed."
+    "${CRAFTY_VENV}/bin/python" -c \
+        'import cryptography; from cryptography.hazmat.bindings import _rust; print(f"    OK: venv cryptography {cryptography.__version__}")' \
+        || die "Crafty cryptography import failed."
 
-    for _ in {1..10}; do
-        curl -kfsS -o /dev/null https://127.0.0.1:8443/ && break
-        sleep 3
+    wait_for_initialization
+    verify_host_stats
+
+    local https_ok=0
+    for _ in {1..15}; do
+        if curl -kfsS -o /dev/null https://127.0.0.1:8443/; then
+            https_ok=1
+            break
+        fi
+        sleep 2
     done
-    curl -kfsS -o /dev/null https://127.0.0.1:8443/ || {
-        echo '    ERROR: Crafty HTTPS check failed.' >&2
-        tail -n 80 "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null || true
+
+    (( https_ok == 1 )) || {
+        echo '    ERROR: Crafty HTTPS endpoint is not responding.' >&2
+        tail -n 100 "${CRAFTY_HOME}/logs/crafty-service.log" 2>/dev/null || true
         exit 1
     }
+
     ok "Crafty HTTPS endpoint is responding"
 }
 
 show_success() {
-    local username password
-    username="admin"
-    password="Unavailable"
+    local username="admin"
+    local password="Unavailable"
+
     if [[ -f "${CRAFTY_CREDS}" ]]; then
         read -r username password < <("${CRAFTY_VENV}/bin/python" - "${CRAFTY_CREDS}" <<'PY'
 import json
 import pathlib
 import sys
+
 c = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 print(c.get("username", "admin"), c.get("password", "Unavailable"))
 PY
@@ -250,6 +384,7 @@ PY
     printf '\nCrafty status:\n'
     sv status crafty
     printf '\nCredentials file: %s\n' "${CRAFTY_CREDS}"
+    printf 'Dependency log : %s\n' "${PIP_LOG}"
 }
 
 main() {
