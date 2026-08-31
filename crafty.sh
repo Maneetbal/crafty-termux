@@ -196,8 +196,9 @@ install_python_dependencies() {
     export CMAKE_PREFIX_PATH="${PREFIX}"
     export PKG_CONFIG_PATH="${PREFIX}/lib/pkgconfig"
     export PATH="${PREFIX}/bin:${JAVA_HOME_TERMUX}/bin:${PATH}"
-    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-4}"
-    (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=4
+    # Serial Rust builds avoid Android Text file busy errors in Termux.
+    export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-1}"
+    (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=1
 
     : > "${PIP_LOG}"
     echo "    Pip output is shown live and saved to ${PIP_LOG}"
