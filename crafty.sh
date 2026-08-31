@@ -38,7 +38,7 @@ require_termux() {
 install_packages() {
     say "Installing required Termux packages"
     pkg update -y
-    pkg install -y openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
+    pkg install -y -o Dpkg::Options::=--force-confold openssh termux-services curl git python clang llvm make openssl libffi rust cmake pkg-config argon2 \
         python-psutil python-cryptography python-pillow openjdk-25
     ok "Termux packages are installed"
 }
