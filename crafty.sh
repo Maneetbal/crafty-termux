@@ -207,6 +207,8 @@ install_python_dependencies() {
     (( CARGO_BUILD_JOBS >= 1 && CARGO_BUILD_JOBS <= 4 )) || CARGO_BUILD_JOBS=1
 
     : > "${PIP_LOG}"
+    echo "    Installing build dependencies... This may take several minutes."
+    echo "    Please wait; some packages may need to compile from source."
     echo "    Pip output is shown live and saved to ${PIP_LOG}"
 
     if ! "${CRAFTY_VENV}/bin/python" -m pip install --no-cache-dir \
